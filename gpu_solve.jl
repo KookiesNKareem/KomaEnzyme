@@ -1,119 +1,132 @@
-using CUDA
-using KernelAbstractions
-using KernelAbstractions.Extras: @unroll
-using Adapt
-using Enzyme
-using LinearAlgebra
-using Random
-using DifferentiationInterface
+using CUDA, KernelAbstractions, Adapt
+using Enzyme, DifferentiationInterface
+using LinearAlgebra, Random
+using .EnzymeRules
 
-#==== Physics & GPU kernel setup ====#
 const PHYS = (
-    γ = 42.58e6 * 2π,  # gyromagnetic ratio in Hz/T
-    Tscale = 1.0       # unit scale for Δf/Δt if needed
+    γ = 42.58e6 * 2π,
+    Tscale = 1.0
 )
 
 @kernel unsafe_indices=true inbounds=true function excitation!(
     M_xy::AbstractVector{Complex{T}}, M_z::AbstractVector{T},
-    p_x::AbstractVector{T}, p_y::AbstractVector{T}, p_z::AbstractVector{T},
-    ΔBz::AbstractVector{T}, T1::AbstractVector{T}, T2::AbstractVector{T}, ρ::AbstractVector{T},
-    Gx::AbstractVector{T}, Gy::AbstractVector{T}, Gz::AbstractVector{T},
-    Δt::T, B::T, M0::T
+    N_Spins::UInt32,
+    N_Δt::UInt32
 ) where {T}
-    i = @index(Global, Linear)
-    if i <= length(M_z)
+    γ = 42.58f6 * 2π
 
-        Mxy = M_xy[i]
-        mz  = M_z[i]
-
-        γ = PHYS.γ
-
-        ω = γ * B
-
-        cross_x =  ω * (im * Mxy)
-        cross_z = 0
-        relax_x = -real(Mxy)/T2[i]
-        relax_y = -imag(Mxy)/T2[i]
-        relax_z = (mz - M0)/T1[i]
-
-        Mxy_new = Mxy + Complex(relax_x, relax_y) * Δt + cross_x * Δt
-        mz_new   = mz   + relax_z * Δt
-        M_xy[i] = Mxy_new
-        M_z[i]  = mz_new
-    end
+    @uniform N = @groupsize()[1]
+    i_l = @index(Local,  Linear)
+    i_g = @index(Group,  Linear)
+    i   = (i_g - 1u32)*UInt32(N) + i_l
+    # if i <= N_Spins
+    #     # load per‐spin state
+    #     # x, y, z      = get_spin_coordinates(p_x, p_y, p_z, i, 1)
+    #     x = p_x[i]
+    #     y = p_y[i]
+    #     z= p_z[i]
+    #     ΔBz          = p_ΔBz[i]
+    #     Mxy_r, Mxy_i = reim(M_xy[i])
+    #     Mz           = M_z[i]
+    #     ρ            = p_ρ[i]
+    #     T1           = p_T1[i]
+    #     T2           = p_T2[i]
+    #   for s_idx in UInt32(1):N_Δt
+    #     # x, y, z = get_spin_coordinates(p_x, p_y, p_z, i, s_idx)
+    #     # effective field
+    #     Bz = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) + ΔBz - s_Δf[s_idx] / γ
+    #     B1_r, B1_i = reim(s_B1[s_idx])
+    #     B = sqrt(B1_r^2 + B1_i^2 + Bz^2)
+    #     Δt = s_Δt[s_idx]
+    #     φ  = -π * γ * B * Δt
+    #     sin_φ, cos_φ = sincos(φ)
+    #     # rotation coefficients
+    #     α_r =  cos_φ
+    #     α_i = -(iszero(B) ? Bz/(B + eps(T)) : Bz/B) * sin_φ
+    #     β_r =  (iszero(B) ?  B1_i/(B + eps(T)) : B1_i/B) * sin_φ
+    #     β_i = -(iszero(B) ?  B1_r/(B + eps(T)) : B1_r/B) * sin_φ
+    #     # apply rotation + relaxation
+    #     Mxy_new_r = 2*(Mxy_i*(α_r*α_i - β_r*β_i) + Mz*(α_i*β_i + α_r*β_r)) + Mxy_r*(α_r^2 - α_i^2 - β_r^2 + β_i^2)
+    #     Mxy_new_i = -2*(Mxy_r*(α_r*α_i + β_r*β_i) - Mz*(α_r*β_i - α_i*β_r)) + Mxy_i*(α_r^2 - α_i^2 + β_r^2 - β_i^2)
+    #     Mz_new     =  Mz*(α_r^2 + α_i^2 - β_r^2 - β_i^2) - 2*(Mxy_r*(α_r*β_r - α_i*β_i) + Mxy_i*(α_r*β_i + α_i*β_r))
+    #     ΔT1 = exp(-Δt/T1)
+    #     ΔT2 = exp(-Δt/T2)
+    #     Mxy_r = Mxy_new_r * ΔT2
+    #     Mxy_i = Mxy_new_i * ΔT2
+    #     Mz    = Mz_new    * ΔT1 + ρ*(1 - ΔT1)
+    #   end
+      M_xy[i] = Complex(Mxy_r, Mxy_i)
+      M_z[i]  = Mz
+    # end
 end
 
-
-const GPU = CUDABackend()
-function step_gpu!(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1, T2, ρ, dt, B, M0)
-    n = length(M_z)
-    threads = 256
-    blocks  = cld(n, threads)
+function solve_steps!(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv, dt, B, M0, GPU, threads, blocks, Nsteps)
     ker = excitation!(GPU, threads)
-    ker(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1, T2, ρ,
-        nothing, nothing, nothing,
-        dt, B, M0;
-        ndrange = (blocks,))
-    KernelAbstractions.synchronize(GPU)
-    return
-end
-
-target = rand(Float32, 3)
-x0 = rand(Float32, 3)
-params = (
-    γ = PHYS.γ, 
-    B = 1f-6, 
-    T1 = 1.0f0, 
-    T2 = 0.5f0, 
-    M0 = 1.0f0)
-dt = 0.001f0
-tmax = 1.0f0
-
-function solve_gpu(m0, dt, tmax, params)
-    Nsteps = Int(round(tmax/dt))
-
-    M_xy = fill(Complex{Float32}(m0[1], m0[2]), length(m0)) |> adapt(GPU)
-    M_z  = fill(m0[3], length(m0)) |> adapt(GPU)
-
-    n = length(m0)
-    p_x = fill(m0[1], n) |> adapt(GPU)
-    p_y = fill(m0[2], n) |> adapt(GPU)
-    p_z = fill(m0[3], n) |> adapt(GPU)
-    ΔBz= zeros(Float32,n) |> adapt(GPU)
-    T1v = fill(params.T1,n) |> adapt(GPU)
-    T2v = fill(params.T2,n) |> adapt(GPU)
-    ρv  = fill(params.M0,n) |> adapt(GPU)
-    
     for _ in 1:Nsteps
-        step_gpu!(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv, dt, params.B, params.M0)
+        ker(M_xy, M_z, p_x, p_y, p_z,
+            ΔBz, T1v, T2v, ρv,
+            dt, B, M0; ndrange = blocks)
     end
-
-    Mf = Array(M_z)[1]
-    return Mf
+    KernelAbstractions.synchronize(GPU)
+    return M_z
 end
 
-f = x -> begin
-    final = solve_gpu(x, dt, tmax, params)
-    return sum(abs2, final .- target[3])
+function init_gpu_arrays(cpu_mxy, dt, tmax, params, GPU)
+    Nsteps = ceil(Int, tmax / dt)
+
+    threads = 256
+    cpu_mz = zeros(Float32, length(cpu_mxy))
+    blocks  = length(cpu_mz)
+
+    M_xy = adapt(GPU, cpu_mxy)
+    M_z  = adapt(GPU, cpu_mz)
+
+    p_x = p_y = p_z = adapt(GPU, zeros(Float32, length(cpu_mz)))
+    ΔBz = adapt(GPU, zeros(Float32, length(cpu_mz)))
+    T1v = fill!(similar(ΔBz), params.T1)
+    T2v = fill!(similar(ΔBz), params.T2)
+    ρv  = fill!(similar(ΔBz), 1.0f0)
+
+    return threads, blocks, Nsteps, M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv
 end
 
+Random.seed!(123)
+cpu_target_z = rand(Float32, 10)
 
-function gradient_descent!(x, α)
-    val, grad = value_and_gradient(f, AutoEnzyme(;mode=Reverse), x)
-    println("Current value: ", val)
-    println("Gradient: ", grad)
-    return x .- α .* grad, val
+const GPU_BACKEND = CUDA.CUDABackend()
+const target_z = adapt(GPU_BACKEND, cpu_target_z)
+
+const params = (γ = PHYS.γ, B = 1f-6, T1 = 1.0f0, T2 = 0.5f0, M0 = 1.0f0)
+mxy_init = rand(Complex{Float32}, 10)
+α  = 1f-2
+iters = 100
+
+dt, tmax = 0.001f0, 1.0f0
+threads, blocks, Nsteps,
+M_xy, M_z, p_x, p_y, p_z,
+ΔBz, T1v, T2v, ρv = init_gpu_arrays(mxy_init, dt, tmax, params, GPU_BACKEND)
+const other_args = (M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv, dt, threads, blocks, Nsteps)
+
+function f(mxy0::AbstractVector{Complex{T}}) where {T}
+    M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv, dt, threads, blocks, Nsteps = other_args
+    final_Mz = solve_steps!(mxy0, M_z, p_x, p_y, p_z,
+        ΔBz, T1v, T2v, ρv,
+        dt, params.B, params.M0,
+        GPU_BACKEND, threads, blocks, Nsteps )
+    return Float32(sum(abs2, final_Mz .- target_z))
 end
-
-
-x = x0
-α =1f-2
-iters = 1000
-
-
+∂Mxy = similar(mxy_init)
 for i in 1:iters
-    val, grad = value_and_gradient(f, AutoEnzyme(; mode=Reverse), x)
-    x .= x .- α .* grad
+    autodiff(Reverse,
+        f,
+        Duplicated(mxy_init, ∂Mxy))
+    Enzyme.autodiff_deferred(Reverse,
+        Enzyme.Const(f), Const,
+        Duplicated(mxy_init, ∂Mxy))
+    # val, grad_mxy = value_and_gradient(f, AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse)), mxy_init)
+    println("iter $i – ", ∂Mxy)
+    break
+    # mxy_init .-= α .* ∂Mxy
 end
 
-println("Optimized x: ", x)
+println("Optimized mxy_init: ", mxy_init)

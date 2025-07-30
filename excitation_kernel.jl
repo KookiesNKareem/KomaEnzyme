@@ -4,11 +4,6 @@ using KernelAbstractions.Extras: @unroll
 using Adapt
 using Enzyme
 
-# 1) Pack your truly-constant physics parameters here:
-const PHYS = (
-  γ      = 42.58e6 * 2π,   # gyromagnetic ratio in Hz/T
-)
-
 # @inline function get_spin_coordinates(x::AbstractVector{T}, y::AbstractVector{T},
 #                                       z::AbstractVector{T}, i::Integer, t::Integer) where {T}
 #   @inbounds (x[i], y[i], z[i])
@@ -32,8 +27,7 @@ const u32 = Literal(UInt32)
     @Const(s_Δt), @Const(s_Δf), @Const(s_B1),
     N_Δt::UInt32
 ) where {T}
-    # unpack constants
-    γ = PHYS
+    γ = 42.58f6 * 2π
 
     # thread/block indices
     @uniform N = @groupsize()[1]
@@ -54,13 +48,11 @@ const u32 = Literal(UInt32)
         T1           = p_T1[i]
         T2           = p_T2[i]
 
-      # time‐stepping (always update coords)
       for s_idx in UInt32(1):N_Δt
         # x, y, z = get_spin_coordinates(p_x, p_y, p_z, i, s_idx)
 
         # effective field
-        Bz = x*s_Gx[s_idx] + y*s_Gy[s_idx] + z*s_Gz[s_idx] + ΔBz
-        Bz -= s_Δf[s_idx] / Tscale
+        Bz = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) + ΔBz - s_Δf[s_idx] / γ
         B1_r, B1_i = reim(s_B1[s_idx])
         B = sqrt(B1_r^2 + B1_i^2 + Bz^2)
 
@@ -148,14 +140,14 @@ excite!(M_xy, M_z, p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
 s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1, NΔt)
 
 # prepare adjoints
-∂Mxy = ones(eltype(M_xy), size(M_xy)...) |> adapt(CUDABackend())
-∂Mz  = zeros(eltype(M_z),  size(M_z) )  |> adapt(CUDABackend())
+# ∂Mxy = ones(eltype(M_xy), size(M_xy)...) |> adapt(CUDABackend())
+# ∂Mz  = zeros(eltype(M_z),  size(M_z) )  |> adapt(CUDABackend())
 
-# reverse-mode AD
-autodiff(Reverse,
-        excite!,
-        Duplicated(M_xy, ∂Mxy),
-        Duplicated(M_z,  ∂Mz),
-        Const(CUDABackend()))
+# # reverse-mode AD
+# autodiff(Reverse,
+#         excite!,
+#         Duplicated(M_xy, ∂Mxy),
+#         Duplicated(M_z,  ∂Mz),
+#         Const(CUDABackend()))
 
-println("Reverse-mode AD complete.")
+# println("Reverse-mode AD complete.")
