@@ -44,7 +44,10 @@ end
 
     if i <= N_Spins
       # load per‐spin state
-        x, y, z      = get_spin_coordinates(p_x, p_y, p_z, i, 1)
+    #   x, y, z      = get_spin_coordinates(p_x, p_y, p_z, i, 1)
+        x = p_x[i]
+        y = p_y[i]
+        z= p_z[i]
         ΔBz          = p_ΔBz[i]
         Mxy_r, Mxy_i = reim(M_xy[i])
         Mz           = M_z[i]
@@ -53,7 +56,8 @@ end
         T2           = p_T2[i]
 
       for s_idx in UInt32(1):N_Δt
-        x, y, z = get_spin_coordinates(p_x, p_y, p_z, i, s_idx)
+        # x, y, z = get_spin_coordinates(p_x, p_y, p_z, i, s_idx)
+
         # effective field
         Bz = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) + ΔBz - s_Δf[s_idx] / γ
         B1_r, B1_i = reim(s_B1[s_idx])
