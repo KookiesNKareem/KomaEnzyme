@@ -13,17 +13,10 @@ const γ = 42.58e6 * 2π
 function solve_steps!(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
                       Δt_steps, backend, threads, blocks,
                       s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1)
-    println("no error yet")
-    # simple_ker = excitation_simple!(backend, 256)(M_xy, p_x, p_y, p_z, UInt32(length(M_xy)), ndrange=threads)
-    ker = excitation!(backend, threads)(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
+    excitation!(backend, threads)(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
                UInt32(length(M_xy)), s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1,
                UInt32(length(Δt_steps)), ndrange=blocks)
-    # simple_ker(M_xy, p_x, p_y, p_z, UInt32(length(M_xy)))
     CUDA.synchronize()
-    # ker( M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
-    #           UInt32(length(M_xy)), s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1,
-    #           UInt32(length(Δt_steps)))
-    # CUDA.synchronize()
     return M_xy
 end
 
