@@ -2,10 +2,10 @@ using CUDA
 using KernelAbstractions
 using Adapt
 using Enzyme
-using DifferentiationInterface
 using LinearAlgebra
 using Random
 using .EnzymeRules
+using KernelAbstractions: NDRange, StaticSize
 include("miniKomaCore.jl")
 
 const γ = 42.58e6 * 2π
@@ -13,17 +13,16 @@ const γ = 42.58e6 * 2π
 function solve_steps!(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
                       Δt_steps, backend, threads, blocks,
                       s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1)
-    global_range = (blocks * threads,)
-    local_size   = (threads,)
-    simple_ker = excitation_simple!(backend, global_range, local_size)
+    println("no error yet")
+    simple_ker = excitation_simple!(backend, 256)(M_xy, p_x, p_y, p_z, UInt32(length(M_xy)), ndrange=threads)
     # ker = excitation!(backend, global_range, local_size))
-    simple_ker(M_xy, p_x, p_y, p_z, UInt32(length(M_xy)))
+    # simple_ker(M_xy, p_x, p_y, p_z, UInt32(length(M_xy)))
     CUDA.synchronize()
     # ker( M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
     #           UInt32(length(M_xy)), s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1,
     #           UInt32(length(Δt_steps)))
     # CUDA.synchronize()
-    return M_xy, M_z
+    return M_xy
 end
 
 function init_gpu_arrays(cpu_mxy::Vector{Complex{Float32}}, dt::Float32,
@@ -70,18 +69,32 @@ s_Gx, s_Gy, s_Gz, s_Δt, s_f, s_B1 = init_gpu_arrays(cpu_init, dt, cpu_Δt, tmax
 
 target = adapt(backend, rand(Float32, 10))
 
+
+
 # Objective
 function f(M_xy0)
-    M_xy, _ = solve_steps!(M_xy0, M_z, p_x, p_y, p_z,
+    M_xy = solve_steps!(M_xy0, M_z, p_x, p_y, p_z,
                            ΔBz, T1v, T2v, ρv,
                            Δt, backend, threads, blocks,
                            s_Gx, s_Gy, s_Gz, s_Δt, s_f, s_B1)
-    return sum(abs2, M_xy .- target)
+    return gpu_sum(M_xy, target)
 end
 
 # Gradient descent loop
 grad = similar(M_xy)
 for i in 1:100
-    val, back = value_and_gradient(f, AutoEnzyme(;mode=Enzyme.Reverse), M_xy)
-    println("Iter: $(i) Back: $(back)")
+    # 1) Forward pass
+    acc = f(M_xy)                     # CuArray{Float32,1}
+    val = Array(acc)[1]                   # pull back the scalar
+
+    # 2) Reverse‐mode Jacobian (1×N) as a 1‐tuple
+    (Jmat,) = jacobian(Reverse, f, M_xy)
+
+    # 3) Copy the gradient into your buffer
+    g = copy(vec(Jmat))  
+    CUDA.copyto!(grad, g)
+
+    println("Iter $i: val = $val, ∥grad∥=$(norm(grad))")
+
+    # 4) update M_xy however you like, e.g. M_xy .-= η * grad
 end

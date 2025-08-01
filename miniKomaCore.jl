@@ -89,3 +89,29 @@ end
       M_z[i]  = Mz
     end
 end
+
+@kernel unsafe_indices=true inbounds=true function sum_kernel!(
+    M_xy::AbstractVector{Complex{T}},
+    target::AbstractVector{T},
+    acc::AbstractVector{T},
+    N::UInt32,
+) where {T}
+    if @index(Global, Linear) == 1
+        s = zero(T)
+        for i in 1:Int(N)
+            x  = M_xy[i]
+            dx = real(x) - target[i]
+            dy = imag(x)
+            s += dx*dx + dy*dy
+        end
+        acc[1] = s
+    end
+end
+
+function gpu_sum(M_xy::CuArray{ComplexF32,1},
+    target::CuArray{Float32,1})
+    N   = UInt32(length(M_xy))
+    acc = CUDA.zeros(Float32, 1)
+    sum_kernel!(CUDA.CUDABackend(), 1)(M_xy, target, acc, N; ndrange = 1)
+    return acc
+end
