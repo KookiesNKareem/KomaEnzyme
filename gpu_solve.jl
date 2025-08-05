@@ -96,9 +96,9 @@ const lr = 1f-20
 
 for iter in 1:100
   loss, ∇X = value_and_gradient(
-    f, AutoEnzyme(), X, Const(gp))
+    f, AutoEnzyme(), X, Constant(gp))
 
-  CUDA.@sync CUDA.axpy!(-lr, ∇X, X)
+  CUDA.@sync X .-= lr .* ∇X
   println("iter $iter — loss=$(Array(loss))  ∥grad∥=$(norm(∇X))")
 end
 
