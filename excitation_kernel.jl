@@ -90,7 +90,6 @@ end
 
 const backend = CUDABackend() 
 const groupsize = 256
-# 4) Thin wrapper to move data → GPU, launch, sync:
 function excite!(M_xy, M_z,
                  p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
                  s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1, NΔt)

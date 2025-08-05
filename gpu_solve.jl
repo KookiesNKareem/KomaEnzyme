@@ -14,12 +14,12 @@ const γ = 42.58e6 * 2π
 function solve_steps!(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
                       Δt_steps, backend, threads, blocks,
                       s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1)
-  excitation!(backend, threads)(
-    M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
-    UInt32(length(M_xy)), s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1,
-    UInt32(length(Δt_steps)), ndrange=blocks
-  )
-  CUDA.synchronize()
+    excitation!(backend, threads)(
+        M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
+        UInt32(length(M_xy)), s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1,
+        UInt32(length(Δt_steps)), ndrange=blocks
+    )
+    CUDA.synchronize()
   return M_xy
 end
 
@@ -96,7 +96,7 @@ const lr = 1f-20
 
 for iter in 1:100
   loss, ∇X = value_and_gradient(
-    f, AutoEnzyme(), X)
+    f, AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse)), X)
 
   X .-= lr .* ∇X
   println("iter $iter — loss=$(Array(loss))  ∥grad∥=$(norm(∇X))")
