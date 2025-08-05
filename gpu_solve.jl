@@ -74,7 +74,7 @@ My0 = imag(cpu_init)
 X   = adapt(backend, Float32[vcat(Mx0, My0)...])
 const N     = length(Mx0)
 
-function f(X::CuArray{Float32,1}, gp)::Float32
+function f(X, gp)
 
     Mx    = @view X[1:N]
     My    = @view X[N+1:2N]
