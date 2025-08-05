@@ -2,11 +2,11 @@ using CUDA
 using KernelAbstractions
 using Adapt
 using Enzyme
-using Enzyme.API: AutoEnzyme
 using LinearAlgebra
 using Random
-using .EnzymeRules
+using DifferentiationInterface
 using KernelAbstractions: NDRange, StaticSize
+
 include("miniKomaCore.jl")
 
 const γ = 42.58e6 * 2π
@@ -74,7 +74,7 @@ My0 = imag(cpu_init)
 X   = adapt(backend, Float32[vcat(Mx0, My0)...])
 const N     = length(Mx0)
 
-function f(X, gp)
+function f(X)
 
     Mx    = @view X[1:N]
     My    = @view X[N+1:2N]
@@ -96,9 +96,9 @@ const lr = 1f-20
 
 for iter in 1:100
   loss, ∇X = value_and_gradient(
-    f, AutoEnzyme(), X, Constant(gp))
+    f, AutoEnzyme(), X)
 
-  CUDA.@sync X .-= lr .* ∇X
+  X .-= lr .* ∇X
   println("iter $iter — loss=$(Array(loss))  ∥grad∥=$(norm(∇X))")
 end
 
