@@ -88,7 +88,7 @@ function f(X, gp)
         gp.s_Gx, gp.s_Gy, gp.s_Gz, gp.s_Δt, gp.s_f, gp.s_B1
     )
 
-  return sum(abs2, M_f .- gp.target)
+  return sum( abs.(M_f .- gp.target) .^2)
 end
 
 
@@ -96,7 +96,7 @@ const lr = 1f-20
 
 for iter in 1:100
   loss, ∇X = value_and_gradient(
-    f, AutoEnzyme(), X, gp)
+    f, AutoEnzyme(), X, Const(gp))
 
   CUDA.@sync CUDA.axpy!(-lr, ∇X, X)
   println("iter $iter — loss=$(Array(loss))  ∥grad∥=$(norm(∇X))")
