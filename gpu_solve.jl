@@ -72,22 +72,62 @@ function f(M_xy0)
                            ΔBz, T1v, T2v, ρv,
                            Δt, backend, threads, blocks,
                            s_Gx, s_Gy, s_Gz, s_Δt, s_f, s_B1)
-    return gpu_sum(M_xy, target)
+    return sum(abs.(M_xy - target) .^ 2)
 end
 
-# Gradient descent loop
+
+const lr = 1f-20
+
 grad = similar(M_xy)
-for i in 1:100
-    # 1) Forward pass
-    acc = f(M_xy)        
-    val = Array(acc)[1]       
+grad_cpu_real = zeros(Float32, length(M_xy))
+grad_cpu_imag = zeros(Float32, length(M_xy))
+
+for iter in 1:100
+    loss = f(M_xy)
+    loss_cpu = Array(loss)[1]
     
-    # 2) Reverse‐mode Jacobian (1×N) as a 1‐tuple
     (Jmat,) = jacobian(Reverse, f, M_xy)
-
-    # 3) Copy the gradient into your buffer
-    g = copy(vec(Jmat))  
-    CUDA.copyto!(grad, g)
-
-    println("Iter $i: val = $val, ∥grad∥=$(norm(grad))")
+    
+    Jcpu = Array(Jmat)[1, :]
+    for i in eachindex(Jcpu)
+        grad_cpu_real[i] = real(Jcpu[i])
+        grad_cpu_imag[i] = imag(Jcpu[i])
+    end
+    
+    CUDA.@sync begin
+      CUDA.copyto!(real.(grad), grad_cpu_real)
+      CUDA.copyto!(imag.(grad), grad_cpu_imag)
+    end
+    
+    CUDA.@sync CUDA.axpy!(-lr, grad, M_xy)
+    
+    println("Iter $iter: loss = $loss_cpu, ∥grad∥ = $(norm(grad))")
 end
+
+solve_steps!(M_xy, M_z, p_x, p_y, p_z,
+                           ΔBz, T1v, T2v, ρv,
+                           Δt, backend, threads, blocks,
+                           s_Gx, s_Gy, s_Gz, s_Δt, s_f, s_B1)
+
+Mxy_cpu = Array(M_xy)
+
+# 2. Prepare the quantities you want to plot:
+spin_idx = 1:length(Mxy_cpu)
+real_part = real.(Mxy_cpu)
+imag_part = imag.(Mxy_cpu)
+magnitude = abs.(Mxy_cpu)
+
+ENV["GKSwstype"] = "100"
+using Plots
+gr()
+
+# 3. Plot real & imaginary parts together:
+p = plot(spin_idx, magnitude;
+         xlabel="Spin index",
+         ylabel="|M_xy|",
+         title="Magnitude of M_xy",
+         legend=false)
+
+# Save to PNG
+savefig(p, "mxy_plot.png")
+println("✔ Plot saved to mxy_plot.png")

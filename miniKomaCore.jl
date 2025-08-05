@@ -9,22 +9,6 @@ end
     @inbounds (x[i, t], y[i, t], z[i, t])
 end
 
-@kernel unsafe_indices=true inbounds=true function excitation_simple!(
-    M_xy::AbstractVector{Complex{T}},
-    @Const(p_x), @Const(p_y), @Const(p_z),
-    N_spins::UInt32,
-) where {T}
-    gs = @groupsize()[1]
-    li = @index(Local, Linear)
-    gi = @index(Group, Linear)
-    idx = (gi - UInt32(1)) * UInt32(gs) + li
-    if idx <= N_spins
-        x, y, _ = get_spin_coordinates(p_x, p_y, p_z, idx, 1)
-        r, i = reim(M_xy[idx])
-        M_xy[idx] = Complex(r + x, i + y)
-    end
-end
-
 @kernel unsafe_indices=true inbounds=true function excitation!(
     M_xy::AbstractVector{Complex{T}}, M_z::AbstractVector{T},
     @Const(p_x),  @Const(p_y),  @Const(p_z),
@@ -44,7 +28,7 @@ end
 
     if i <= N_Spins
       # load per‐spin state
-    #   x, y, z      = get_spin_coordinates(p_x, p_y, p_z, i, 1)
+        # x, y, z      = get_spin_coordinates(p_x, p_y, p_z, i, 1)
         x = p_x[i]
         y = p_y[i]
         z= p_z[i]
@@ -94,28 +78,28 @@ end
     end
 end
 
-@kernel unsafe_indices=true inbounds=true function sum_kernel!(
-    M_xy::AbstractVector{Complex{T}},
-    target::AbstractVector{T},
-    acc::AbstractVector{T},
-    N::UInt32,
-) where {T}
-    if @index(Global, Linear) == 1
-        s = zero(T)
-        for i in 1:Int(N)
-            x  = M_xy[i]
-            dx = real(x) - target[i]
-            dy = imag(x)
-            s += dx*dx + dy*dy
-        end
-        acc[1] = s
-    end
-end
+# @kernel unsafe_indices=true inbounds=true function sum_kernel!(
+#     M_xy::AbstractVector{Complex{T}},
+#     target::AbstractVector{T},
+#     acc::AbstractVector{T},
+#     N::UInt32,
+# ) where {T}
+#     if @index(Global, Linear) == 1
+#         s = zero(T)
+#         for i in 1:Int(N)
+#             x  = M_xy[i]
+#             dx = real(x) - target[i]
+#             dy = imag(x)
+#             s += dx*dx + dy*dy
+#         end
+#         acc[1] = s
+#     end
+# end
 
-function gpu_sum(M_xy::CuArray{ComplexF32,1},
-    target::CuArray{Float32,1})
-    N   = UInt32(length(M_xy))
-    acc = CUDA.zeros(Float32, 1)
-    sum_kernel!(CUDA.CUDABackend(), 1)(M_xy, target, acc, N; ndrange = 1)
-    return acc
-end
+# function gpu_sum(M_xy::CuArray{ComplexF32,1},
+#     target::CuArray{Float32,1})
+#     N   = UInt32(length(M_xy))
+#     acc = CUDA.zeros(Float32, 1)
+#     sum_kernel!(CUDA.CUDABackend(), 1)(M_xy, target, acc, N; ndrange = 1)
+#     return acc
+# end

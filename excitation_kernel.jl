@@ -3,7 +3,8 @@ using KernelAbstractions
 using KernelAbstractions.Extras: @unroll
 using Adapt
 using Enzyme
-
+Enzyme.API.strictAliasing!(false)
+Enzyme.Compiler.VERBOSE_ERRORS[] = true
 # @inline function get_spin_coordinates(x::AbstractVector{T}, y::AbstractVector{T},
 #                                       z::AbstractVector{T}, i::Integer, t::Integer) where {T}
 #   @inbounds (x[i], y[i], z[i])
