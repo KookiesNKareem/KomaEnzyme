@@ -6,7 +6,6 @@ using LinearAlgebra
 using Random
 using .EnzymeRules
 using KernelAbstractions: NDRange, StaticSize
-using Enzyme.API: AutoEnzyme
 include("miniKomaCore.jl")
 
 const γ = 42.58e6 * 2π
