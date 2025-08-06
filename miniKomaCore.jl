@@ -18,7 +18,7 @@ end
   @Const(s_Δt), @Const(s_Δf), @Const(s_B1),
   N_Δt::UInt32
 ) where {T}
-  const γ = 42.58f6 * 2f0π
+  γ = 42.58f6 * 2f0π
 
   # thread/block indices
   @uniform N = @groupsize()[1]
