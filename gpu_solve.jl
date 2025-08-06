@@ -69,12 +69,15 @@ cpu_Δt    = 0.0f0:dt:tmax
 
 gp, M_xy_gpu = init_gpu_state(cpu_init, dt, cpu_Δt, tmax, params, backend)
 
+# for p in gp
+#   @assert isbitstype(typeof(p)) "Parameter $(p) of type $(typeof(p)) is not a bitstype"
+# end
 Mx0 = real(cpu_init)
 My0 = imag(cpu_init)
 X   = adapt(backend, Float32[vcat(Mx0, My0)...])
 const N     = length(Mx0)
 
-function f(X)
+function f(X, gp)
 
     Mx    = @view X[1:N]
     My    = @view X[N+1:2N]
@@ -96,7 +99,7 @@ const lr = 1f-20
 
 for iter in 1:100
   loss, ∇X = value_and_gradient(
-    f, AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse)), X)
+    f, AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse)), X, Constant(gp))
 
   X .-= lr .* ∇X
   println("iter $iter — loss=$(Array(loss))  ∥grad∥=$(norm(∇X))")

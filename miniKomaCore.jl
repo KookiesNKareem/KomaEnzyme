@@ -1,6 +1,11 @@
 using CUDA
 using KernelAbstractions
 
+struct Literal{T} end
+Literal(T) = Literal{T}()
+Base.:*(x::Number, ::Literal{T}) where T = T(x)
+const u32 = Literal(UInt32)
+
 @inline function get_spin_coordinates(x::AbstractVector{T}, y::AbstractVector{T}, z::AbstractVector{T}, i::Integer, t::Integer) where {T<:Real}
     @inbounds (x[i], y[i], z[i])
 end
