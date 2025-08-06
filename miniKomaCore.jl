@@ -96,7 +96,7 @@ end
 #         acc[1] = s
 #     end
 # end
-
+#
 # function gpu_sum(M_xy::CuArray{ComplexF32,1},
 #     target::CuArray{Float32,1})
 #     N   = UInt32(length(M_xy))

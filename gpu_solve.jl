@@ -102,15 +102,8 @@ for iter in 1:100
   println("iter $iter — loss=$(Array(loss))  ∥grad∥=$(norm(∇X))")
 end
 
-Mxy_opt = complex.(X[1:N], X[N+1:2N]) 
-Mxy_cpu = Array(Mxy_opt)
+Mxy_optimal = complex.(X[1:N], X[N+1:2N]) 
+Mxy_cpu = Array(Mxy_optimal)
 spin_idx = 1:length(Mxy_cpu)
 magnitude = abs.(Mxy_cpu)
-
-ENV["GKSwstype"] = "100"
-using Plots; gr()
-p = plot(spin_idx, magnitude;
-         xlabel="Spin", ylabel="|M_xy|",
-         title="Optimized M_xy", legend=false)
-savefig(p, "mxy_plot.png")
-println("✔ Plot saved to mxy_plot.png")
+println("Final Mxy: ", Mxy_cpu)
