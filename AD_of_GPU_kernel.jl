@@ -76,13 +76,12 @@ X = [real.(mag.M_xy); imag.(mag.M_xy)]
 # Sanity check, does f work?
 f(X, mag, obj, seq, target, backend)
 
-## Gradient calculation, why do I need runtime activity???
+## Gradient calculation, why do we need runtime activity??? --> Understand why
+enzyme_mode = Enzyme.set_runtime_activity(Enzyme.Reverse)
+ad_backend = AutoEnzyme(; mode=enzyme_mode) # Note sure why set_runtime_activity is needed
 # Enzyme
-# ad_backend = Enzyme.set_runtime_activity(Enzyme.Reverse)
-# ∇X = Enzyme.gradient(ad_backend, f, X, Enzyme.Const(mag), Enzyme.Const(obj), Enzyme.Const(seq), Enzyme.Const(target), Enzyme.Const(backend))
-
+# ∇X = Enzyme.gradient(enzyme_mode, f, X, Enzyme.Const(mag), Enzyme.Const(obj), Enzyme.Const(seq), Enzyme.Const(target), Enzyme.Const(backend))
 # DifferentiationInterface
-ad_backend = AutoEnzyme(; mode=Enzyme.set_runtime_activity(Enzyme.Reverse)) # Note sure why set_runtime_activity is needed
 loss, ∇X = value_and_gradient(f, ad_backend, X, Constant(mag), Constant(obj), Constant(seq), Constant(target), Constant(backend))
 
 ## Gradient descent
