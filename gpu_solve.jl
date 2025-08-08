@@ -12,12 +12,12 @@ include("miniKomaCore.jl")
 const γ = 42.58e6 * 2π
 
 function solve_steps!(M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
-                      Δt_steps, backend, threads, blocks,
+                      Δt_steps, backend, threads, Nspins,
                       s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1)
-    excitation!(backend, threads)(
+    excitation_kernel!(backend, threads)(
         M_xy, M_z, p_x, p_y, p_z, ΔBz, T1v, T2v, ρv,
         UInt32(length(M_xy)), s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1,
-        UInt32(length(Δt_steps)), ndrange=blocks
+        UInt32(length(Δt_steps)), true, ndrange=UInt32(Nspins)
     )
     CUDA.synchronize()
   return M_xy
@@ -26,7 +26,6 @@ end
 function init_gpu_state(cpu_mxy, dt, cpu_Δt, tmax, params, backend)
   Nspins = length(cpu_mxy)
   threads = 256
-  blocks  = (Nspins + threads - 1) ÷ threads
 
   M_z  = adapt(backend, zeros(Float32, Nspins))
   M_xy = adapt(backend, cpu_mxy)
@@ -55,7 +54,7 @@ function init_gpu_state(cpu_mxy, dt, cpu_Δt, tmax, params, backend)
     target=target,
     backend=backend,
     threads=threads,
-    blocks=blocks
+    nspins=Nspins
   ), M_xy
 end
 
@@ -87,7 +86,7 @@ function f(X, gp)
         M_xy0, gp.M_z,
         gp.p_x, gp.p_y, gp.p_z,
         gp.ΔBz, gp.T1v, gp.T2v, gp.ρv,
-        gp.Δt, gp.backend, gp.threads, gp.blocks,
+        gp.Δt, gp.backend, gp.threads, gp.nspins,
         gp.s_Gx, gp.s_Gy, gp.s_Gz, gp.s_Δt, gp.s_f, gp.s_B1
     )
 
