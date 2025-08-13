@@ -3,31 +3,110 @@ using KernelAbstractions
 using Adapt
 using DifferentiationInterface
 import Enzyme
+import ChainRulesCore: rrule, NoTangent, ProjectTo
+using LinearAlgebra: norm
 
-backend = CPU() # <-- CPU(), or CUDABackend() for GPU execution
+# backend = CPU()
+# CUDA.allowscalar(true)
 
-## Kernel definition
-include("miniKomaCore.jl")
+backend = CUDABackend()
+CUDA.allowscalar(false)
+
+include("miniKomaCore.jl") 
+
 function excitation_caller!(mag, obj, seq, backend)
+    nthreads = cld(length(mag.M_xy), GROUP_SIZE) * GROUP_SIZE
     excitation_kernel!(backend, GROUP_SIZE)(
-        mag..., 
-        obj..., UInt32(length(obj.p_x)), 
-        seq..., UInt32(length(seq.s_Δt)), 
-        ndrange=cld(length(mag.M_xy), GROUP_SIZE) * GROUP_SIZE
+        mag.M_xy, mag.M_z,
+        obj.p_x, obj.p_y, obj.p_z, obj.p_ΔBz, obj.p_T1, obj.p_T2, obj.p_ρ, UInt32(length(obj.p_x)),
+        seq.s_Gx, seq.s_Gy, seq.s_Gz, seq.s_Δt, seq.s_f, seq.s_B1, UInt32(length(seq.s_Δt));
+        ndrange = nthreads
     )
 end
 
-## Initializing inputs
+# -----------------------
+# AD-safe tiny kernels
+# -----------------------
+
+# Pack X = [Mx; My] (Float32) -> ComplexF32 M_xy on device
+@kernel function pack_complex!(M::AbstractVector{ComplexF32}, X::AbstractVector{Float32}, N::UInt32)
+    i = @index(Global)
+    if i <= N
+        @inbounds M[i] = ComplexF32(X[i], X[i + Int(N)])
+    end
+end
+
+# Per-element squared L2 difference on device: out[i] = |A[i]-B[i]|^2
+@kernel function l2loss_elem!(out::AbstractVector{Float32},
+                              A::AbstractVector{ComplexF32},
+                              B::AbstractVector{ComplexF32})
+    i = @index(Global)
+    if i <= length(A)
+        @inbounds d = A[i] - B[i]
+        @inbounds out[i] = real(d)*real(d) + imag(d)*imag(d)
+    end
+end
+
+# -----------------------
+# Differentiable GPU reduction wrapper
+# -----------------------
+gpu_sum(x) = CUDA.sum(x)
+
+function rrule(::typeof(gpu_sum), x::CuArray{T}) where {T}
+    y = gpu_sum(x)                 # scalar (computed on device, read on host)
+    proj = ProjectTo(x)
+    function pullback(ȳ)
+        # d/dx sum(x) = 1  =>  ∂L/∂x = ȳ * ones_like(x)
+        c = convert(T, ȳ)
+        gx = CUDA.fill(c, size(x))
+        return (NoTangent(), proj(gx))
+    end
+    return y, pullback
+end
+
+# -----------------------
+# Loss function (differentiable)
+# -----------------------
+# function f(X, mag, obj, seq, target, backend)
+#     @assert eltype(X) === Float32
+#     @assert X isa CuArray{Float32}
+
+#     N = length(X) ÷ 2
+#     @views mag.M_xy .= X[1:N] .+ (1f0im) .* X[N+1:end]
+
+#     # 2) Physics step (in-place)
+#     excitation_caller!(mag, obj, seq, backend)
+
+#     # 3) Elementwise loss on device
+#     tmp = similar(mag.M_xy, Float32)
+#     nthreads2 = cld(length(tmp), GROUP_SIZE) * GROUP_SIZE
+#     l2loss_elem!(backend, GROUP_SIZE)(tmp, mag.M_xy, target; ndrange = nthreads2)
+
+#     # 4) Differentiable reduction
+#     return gpu_sum(tmp)
+# end
+
+function f(X, mag, obj, seq, target, backend)
+    @assert eltype(X) === Float32
+    @assert X isa CuArray{Float32}
+
+    N = length(X) ÷ 2
+    Z = complex.(X[1:N], X[N+1:end])
+    mag_new = (; mag..., M_xy=Z)
+
+    excitation_caller!(mag_new, obj, seq, backend)
+    loss = sum(abs.(mag_new.M_xy .- target).^2)
+    return loss
+end
+
 # Magnetization
 Nspins = 100
 mag = (;
     M_xy = zeros(Complex{Float32}, Nspins),
-    M_z = zeros(Float32, Nspins)
+    M_z  = zeros(Float32, Nspins)
 )
 # Phantom
-T1=1.0f0
-T2=0.5f0
-M0=1.0f0
+T1 = 1.0f0; T2 = 0.5f0; M0 = 1.0f0
 obj = (;
     p_x = zeros(Float32, Nspins),
     p_y = zeros(Float32, Nspins),
@@ -35,7 +114,7 @@ obj = (;
     p_ΔBz = zeros(Float32, Nspins),
     p_T1 = fill(T1, Nspins),
     p_T2 = fill(T2, Nspins),
-    p_ρ = fill(M0, Nspins)
+    p_ρ  = fill(M0, Nspins)
 )
 # Sequence
 Nt = 100
@@ -45,51 +124,27 @@ seq = (;
     s_Gy = zeros(Float32, Nt),
     s_Gz = zeros(Float32, Nt),
     s_Δt = fill(dt, Nt),
-    s_f = zeros(Float32, Nt),
+    s_f  = zeros(Float32, Nt),
     s_B1 = 1f-6 * ones(Complex{Float32}, Nt)
 )
-# Target magnetization
+# Target
 target = rand(Complex{Float32}, Nspins)
 
-## Optimization-related
-# Loss function f
-function f(X, mag, obj, seq, target, backend)
-    # Unpack X. Note that X is a real vector [Mx; My] to not have problems with complex vectors in Enzyme.
-    N = length(X) ÷ 2
-    Mx = @view X[1:N]
-    My = @view X[N+1:2N]
-    # Replaces value in struct mag (initial xy-magnetization = X). For optimizing Bx it should replace seq.s_B1 ...
-    mag = (; mag..., M_xy=complex.(Mx, My))
-    excitation_caller!(mag, obj, seq, backend) # This modifies mag in-place
-    # Calculate the loss
-    loss = sum(abs.(mag.M_xy .- target) .^ 2) # sum(abs2, mag.M_xy .- target), doesn't work with Enzyme yet
-    return loss
-end
-
-## Adapt the structs to the backend
-mag = mag |> adapt(backend)
-obj = obj |> adapt(backend)
-seq = seq |> adapt(backend)
+# Move everything to GPU backend
+mag    = mag    |> adapt(backend)
+obj    = obj    |> adapt(backend)
+seq    = seq    |> adapt(backend)
 target = target |> adapt(backend)
-X = [real.(mag.M_xy); imag.(mag.M_xy)]
 
-# Sanity check, does f work?
-f(X, mag, obj, seq, target, backend)
+X = cu(zeros(Float32, Nspins * 2))
 
-## Gradient calculation, why do we need runtime activity??? --> Understand why
+# Gradient via Enzyme
 enzyme_mode = Enzyme.set_runtime_activity(Enzyme.Reverse)
-ad_backend = AutoEnzyme(; mode=enzyme_mode) # Note sure why set_runtime_activity is needed
-# Enzyme
-# ∇X = Enzyme.gradient(enzyme_mode, f, X, Enzyme.Const(mag), Enzyme.Const(obj), Enzyme.Const(seq), Enzyme.Const(target), Enzyme.Const(backend))
-# DifferentiationInterface
-loss, ∇X = value_and_gradient(f, ad_backend, X, Constant(mag), Constant(obj), Constant(seq), Constant(target), Constant(backend))
+ad_backend  = AutoEnzyme(; mode = enzyme_mode)
 
-## Gradient descent
-# lr = 1f-20
-# for iter in 1:100
-#     loss, ∇X = value_and_gradient(f, AutoEnzyme(; mode=Enzyme.Reverse), X, Constant(mag), Constant(obj), Constant(seq), Constant(target), Constant(backend))
-#     X .-= lr .* ∇X
-#     println("iter $iter — loss=$(loss)  ∥grad∥=$(norm(∇X))")
-# end
-## Result
-# Mxy_optimal = complex.(X[1:N], X[N+1:2N]) |> adapt(CPU())
+loss, ∇X = value_and_gradient(f, ad_backend, X,
+                              Constant(mag), Constant(obj), Constant(seq),
+                              Constant(target), Constant(backend))
+
+@info "loss" loss
+@info "‖grad‖" norm(Array(∇X))
