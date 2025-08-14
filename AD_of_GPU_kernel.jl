@@ -24,68 +24,6 @@ function excitation_caller!(mag, obj, seq, backend)
     )
 end
 
-# -----------------------
-# AD-safe tiny kernels
-# -----------------------
-
-# Pack X = [Mx; My] (Float32) -> ComplexF32 M_xy on device
-@kernel function pack_complex!(M::AbstractVector{ComplexF32}, X::AbstractVector{Float32}, N::UInt32)
-    i = @index(Global)
-    if i <= N
-        @inbounds M[i] = ComplexF32(X[i], X[i + Int(N)])
-    end
-end
-
-# Per-element squared L2 difference on device: out[i] = |A[i]-B[i]|^2
-@kernel function l2loss_elem!(out::AbstractVector{Float32},
-                              A::AbstractVector{ComplexF32},
-                              B::AbstractVector{ComplexF32})
-    i = @index(Global)
-    if i <= length(A)
-        @inbounds d = A[i] - B[i]
-        @inbounds out[i] = real(d)*real(d) + imag(d)*imag(d)
-    end
-end
-
-# -----------------------
-# Differentiable GPU reduction wrapper
-# -----------------------
-gpu_sum(x) = CUDA.sum(x)
-
-function rrule(::typeof(gpu_sum), x::CuArray{T}) where {T}
-    y = gpu_sum(x)                 # scalar (computed on device, read on host)
-    proj = ProjectTo(x)
-    function pullback(ȳ)
-        # d/dx sum(x) = 1  =>  ∂L/∂x = ȳ * ones_like(x)
-        c = convert(T, ȳ)
-        gx = CUDA.fill(c, size(x))
-        return (NoTangent(), proj(gx))
-    end
-    return y, pullback
-end
-
-# -----------------------
-# Loss function (differentiable)
-# -----------------------
-# function f(X, mag, obj, seq, target, backend)
-#     @assert eltype(X) === Float32
-#     @assert X isa CuArray{Float32}
-
-#     N = length(X) ÷ 2
-#     @views mag.M_xy .= X[1:N] .+ (1f0im) .* X[N+1:end]
-
-#     # 2) Physics step (in-place)
-#     excitation_caller!(mag, obj, seq, backend)
-
-#     # 3) Elementwise loss on device
-#     tmp = similar(mag.M_xy, Float32)
-#     nthreads2 = cld(length(tmp), GROUP_SIZE) * GROUP_SIZE
-#     l2loss_elem!(backend, GROUP_SIZE)(tmp, mag.M_xy, target; ndrange = nthreads2)
-
-#     # 4) Differentiable reduction
-#     return gpu_sum(tmp)
-# end
-
 function f(X, mag, obj, seq, target, backend)
     @assert eltype(X) === Float32
     @assert X isa CuArray{Float32}
