@@ -92,8 +92,8 @@ function f(X, mag, obj, seq, target, backend)
 
     N = length(X) ÷ 2
     Z = complex.(X[1:N], X[N+1:end])
-    mag_new = (; mag..., M_xy=Z)
-
+    mag_new = (; deepcopy(mag)..., M_xy=Z)
+    # mag_new = (M_xy=mag.M_xy, M_z=mag.M_z) |> adapt(backend)
     excitation_caller!(mag_new, obj, seq, backend)
     loss = sum(abs.(mag_new.M_xy .- target).^2)
     return loss
