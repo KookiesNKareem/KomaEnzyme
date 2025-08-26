@@ -2,6 +2,7 @@ using CUDA
 using KernelAbstractions
 
 const γ = 42.58f6
+
 struct Literal{T} end
 Literal(T) = Literal{T}()
 Base.:*(x::Number, ::Literal{T}) where T = T(x)

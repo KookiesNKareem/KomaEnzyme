@@ -18,6 +18,7 @@ CUDA.allowscalar(false)
 const GROUP_SIZE = 256
 seed!(42)
 
+
 function excitation_caller!(M_xy, M_z, obj, seq, backend)
     nthreads = cld(length(M_xy), GROUP_SIZE) * GROUP_SIZE
     excitation_kernel!(backend, GROUP_SIZE)(M_xy, M_z, obj.p_x, obj.p_y, obj.p_z, obj.p_ΔBz, obj.p_T1, obj.p_T2, obj.p_ρ, length(obj.p_x),
