@@ -48,13 +48,13 @@ end
             #     x, y, z = get_spin_coordinates(p_x, p_y, p_z, i, s_idx)
             # end
 
-            Bz = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) + ΔBz - s_Δf[s_idx] / Float32(γ)
+            Bz = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) + ΔBz - s_Δf[s_idx] / T(γ)
             # B1_r, B1_i = reim(s_B1[s_idx]) no reim
             B1_r = s_B1[s_idx]
             B1_i = s_B1[s_idx + N_Δt]
             B = sqrt(B1_r^2 + B1_i^2 + Bz^2)
             Δt = s_Δt[s_idx]
-            φ = Float32(-π * γ) * B * Δt
+            φ = T(-π * γ) * B * Δt
             sin_φ, cos_φ = sincos(φ)
             α_r = cos_φ
             if iszero(B)
