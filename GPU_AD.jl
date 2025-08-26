@@ -66,13 +66,11 @@ seq = (;
 target = rand(Float32, Nspins * 2)
 
 # Move to GPU 
-if backend isa CUDABackend
-    M_xy = M_xy |> adapt(backend)
-    M_z  = M_z  |> adapt(backend)
-    obj    = obj    |> adapt(backend)
-    seq    = seq    |> adapt(backend)
-    target = target |> adapt(backend)
-end
+M_xy = M_xy |> adapt(backend)
+M_z  = M_z  |> adapt(backend)
+obj    = obj    |> adapt(backend)
+seq    = seq    |> adapt(backend)
+target = target |> adapt(backend)
 
 # Gradient via Enzyme
 enzyme_mode = Enzyme.set_runtime_activity(Enzyme.Reverse)
