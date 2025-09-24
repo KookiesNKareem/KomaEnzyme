@@ -16,7 +16,7 @@ end
 end
 
 @kernel unsafe_indices=true inbounds=true function excitation_kernel!(
-    M_xy::AbstractVector{T}, M_z, 
+    M_xy::AbstractVector{Complex{T}}, M_z, 
     @Const(p_x), @Const(p_y), @Const(p_z), @Const(p_ΔBz), @Const(p_T1), @Const(p_T2), @Const(p_ρ), N_Spins,
     @Const(s_Gx), @Const(s_Gy), @Const(s_Gz), @Const(s_Δt), @Const(s_Δf), @Const(s_B1), N_Δt,
     # ::Val{MOTION}
@@ -50,8 +50,10 @@ end
 
             Bz = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) + ΔBz - s_Δf[s_idx] / T(γ)
             # B1_r, B1_i = reim(s_B1[s_idx]) no reim
-            B1_r = s_B1[s_idx]
-            B1_i = s_B1[s_idx + N_Δt]
+            B1_r = real(s_B1[s_idx])
+            B1_i = imag(s_B1[s_idx])
+            # B1_r = s_B1[s_idx]
+            # B1_i = s_B1[s_idx + N_Δt]
             B = sqrt(B1_r^2 + B1_i^2 + Bz^2)
             Δt = s_Δt[s_idx]
             φ = T(-π * γ) * B * Δt
@@ -87,8 +89,9 @@ end
             s_idx += 1u32
         end
         # M_xy[i] = complex(Mxy_r, Mxy_i) no complex operations
-        M_xy[i] = Mxy_r
-        M_xy[i + N_Spins] = Mxy_i
+        M_xy[i] = complex(Mxy_r, Mxy_i)
+        # M_xy[i] = Mxy_r
+        # M_xy[i + N_Spins] = Mxy_i
         M_z[i] = Mz
     end
 end
