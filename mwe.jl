@@ -1,8 +1,3 @@
-############################
-# GPU loss → RF gradient  ##
-# (Enzyme seeded reverse) ##
-############################
-
 import CUDA
 using KernelAbstractions
 using Adapt
@@ -11,27 +6,17 @@ import Random: seed!
 
 CUDA.allowscalar(false)
 
-# -------------------------------
-# Problem size / constants
-# -------------------------------
 const GROUP_SIZE = 256
 const Nspins     = 10
 const Nt         = 100
 const dt         = 1f-5
-const γ          = Float32(2π) * 42.58f6  # keep as Float32
-
+const γ          = Float32(2π) * 42.58f6
 const N_Spins32 = Int32(Nspins)
 const N_Δt32    = Int32(Nt)
 
-# -------------------------------
-# Backend
-# -------------------------------
 backend = CUDA.CUDABackend()
 seed!(42)
 
-# -------------------------------
-# Allocate & initialize (host)
-# -------------------------------
 M_xy_h = zeros(Float32, 2Nspins)
 M_z_h  = zeros(Float32, Nspins)
 
@@ -54,9 +39,6 @@ s_B1i_h = zeros(Float32, Nt)
 target_c = rand(ComplexF32, Nspins)
 target_h = vcat(Float32.(real.(target_c)), Float32.(imag.(target_c)))
 
-# -------------------------------
-# Move to device
-# -------------------------------
 M_xy   = adapt(backend, M_xy_h)
 M_z    = adapt(backend, M_z_h)
 p_x    = adapt(backend, p_x_h)
@@ -75,9 +57,6 @@ s_B1r  = adapt(backend, s_B1r_h)
 s_B1i  = adapt(backend, s_B1i_h)
 target = adapt(backend, target_h)
 
-# -------------------------------
-# Physics kernel
-# -------------------------------
 @kernel unsafe_indices=true inbounds=true function excitation_kernel!(
     M_xy::AbstractVector{T}, M_z::AbstractVector{T},
     p_x::AbstractVector{T}, p_y::AbstractVector{T}, p_z::AbstractVector{T},
@@ -146,7 +125,6 @@ target = adapt(backend, target_h)
     end
 end
 
-# Kernel launcher (no synchronize here; handle syncs in callers)
 function excitation_caller!(M_xy, M_z,
     p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
@@ -160,17 +138,10 @@ function excitation_caller!(M_xy, M_z,
     return nothing
 end
 
-# -------------------------------
-# GPU loss (outside AD)
-# -------------------------------
 function gpu_loss(M_xy::CUDA.CuArray{T}, target::CUDA.CuArray{T}) where {T<:AbstractFloat}
-    # device reduction; returns a host scalar after tiny memcpy
     return CUDA.sum((M_xy .- target) .^ 2)
 end
 
-# -------------------------------
-# Seed gradient of loss wrt M (GPU)
-# -------------------------------
 @kernel function loss_grad_M!(dM, M, TGT)
     i = @index(Global, Linear)
     if i <= length(M)
@@ -178,9 +149,6 @@ end
     end
 end
 
-# -------------------------------
-# Wrapper for physics only (used by Enzyme)
-# -------------------------------
 Base.@noinline function excite_only!(
     M_xy, M_z,
     p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
@@ -194,9 +162,6 @@ Base.@noinline function excite_only!(
     return nothing
 end
 
-# -------------------------------
-# Main: forward → seed → reverse
-# -------------------------------
 function grad_rf!(
     ∇B1r::CUDA.CuArray{Float32}, ∇B1i::CUDA.CuArray{Float32},
     M_xy, M_z,
@@ -205,47 +170,39 @@ function grad_rf!(
     target,
     backend,
 )
-    # Forward (GPU)
     excite_only!(M_xy, M_z,
         p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
         s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
         backend)
     KernelAbstractions.synchronize(backend)
 
-    # Seed dL/dM (GPU)
     dM_xy = similar(M_xy)
     loss_grad_M!(backend, GROUP_SIZE)(dM_xy, M_xy, target; ndrange=length(M_xy))
     KernelAbstractions.synchronize(backend)
 
-    # Zero seeds for other duplicated args
     dM_z = similar(M_z);  fill!(dM_z, 0f0)
     dΔt  = similar(s_Δt); fill!(dΔt,  0f0)
     dΔf  = similar(s_Δf); fill!(dΔf,  0f0)
     fill!(∇B1r, 0f0); fill!(∇B1i, 0f0)
 
-    # Reverse through physics only, seeded with dM_xy
     Enzyme.autodiff(Enzyme.Reverse, excite_only!,
-        Enzyme.Duplicated(M_xy, dM_xy),            # seed ∂L/∂M
+        Enzyme.Duplicated(M_xy, dM_xy),         
         Enzyme.Duplicated(M_z,  dM_z),
         Enzyme.Const(p_x), Enzyme.Const(p_y), Enzyme.Const(p_z),
         Enzyme.Const(p_ΔBz), Enzyme.Const(p_T1), Enzyme.Const(p_T2), Enzyme.Const(p_ρ),
         Enzyme.Const(s_Gx), Enzyme.Const(s_Gy), Enzyme.Const(s_Gz),
         Enzyme.Duplicated(s_Δt, dΔt),
         Enzyme.Duplicated(s_Δf, dΔf),
-        Enzyme.Duplicated(s_B1r, ∇B1r),            # outputs: ∇L/∂B1r
-        Enzyme.Duplicated(s_B1i, ∇B1i),            # outputs: ∇L/∂B1i
+        Enzyme.Duplicated(s_B1r, ∇B1r),            
+        Enzyme.Duplicated(s_B1i, ∇B1i),       
         Enzyme.Const(backend),
     )
     KernelAbstractions.synchronize(backend)
 
-    # Loss value (GPU reduce, post-AD)
     L = gpu_loss(M_xy, target)
     return L
 end
 
-# -------------------------------
-# Run once to demonstrate
-# -------------------------------
 ∇B1r = similar(s_B1r); ∇B1i = similar(s_B1i)
 loss_val = grad_rf!(∇B1r, ∇B1i,
                     M_xy, M_z,
@@ -255,6 +212,5 @@ loss_val = grad_rf!(∇B1r, ∇B1i,
                     backend)
 
 println("loss = ", loss_val)
-# quick sanity peek (host copies only for logging)
 println("‖∇B1r‖₂ = ", sqrt(sum(abs2, Array(∇B1r))))
 println("‖∇B1i‖₂ = ", sqrt(sum(abs2, Array(∇B1i))))
