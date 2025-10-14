@@ -22,28 +22,28 @@ ENV["GKSwstype"] = "100"
 seed!(42)
 
 const GROUP_SIZE = 256
-const Nspins     = 129
-const Nt         = 300 #  Nt*dt = 3ms    
-const dt         = 1.0f-5 # 10 µs
-const γ          = Float32(2π) * 42.58f6
-const N_Spins32  = Int32(Nspins)
-const N_Δt32     = Int32(Nt)
+const Nspins = 129
+const Nt = 300 #  Nt*dt = 3ms    
+const dt = 1.0f-5 # 10 µs
+const γ = Float32(2π) * 42.58f6
+const N_Spins3 = Int32(Nspins)
+const N_Δt32 = Int32(Nt)
 
 const NUM_TIME_SEGMENTS = 200
 const INV_SEG_DUR = NUM_TIME_SEGMENTS / (Nt*dt)
 
 const BW_CUTOFF = 2.5f-3
-const BW_ORDER  = 16       
+const BW_ORDER = 16       
 
 const half_FOVz = 10.0f-3
 const voxel_resolution = (2 * half_FOVz) / (Nspins - 1)
 const position_offset_range = voxel_resolution / 4
 
-const MAX_GZ   = 10.0f-3   
+const MAX_GZ = 10.0f-3   
 const MAX_SLEW = 70.0f0   
 
 const RF_BOUND = 12.0f-6
-const λ_power  = 1.0f-3
+const λ_power = 1.0f-3
 const λ_smooth = 0.2f0
 
 @inline function gz_at(t; Gmax=MAX_GZ, slew=MAX_SLEW)
