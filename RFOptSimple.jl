@@ -1,146 +1,222 @@
-using CUDA
+###############################
+# RF slice design (SPG-BB)
+###############################
+
 using KernelAbstractions
+using KernelAbstractions: CPU
+using CUDA
 using Adapt
 import Enzyme
 using Random: seed!
 using Plots
-using Statistics: mean, maximum
-using LinearAlgebra: norm
+using Statistics: mean, maximum, minimum
+import Atomix         
 
-ENV["GKSwstype"] = "100" 
-
+const backend = CUDA.CUDABackend()
+# const backend = CPU()
 CUDA.allowscalar(false)
+
+Plots.gr()
+Plots.default(fmt=:png)
+ENV["GKSwstype"] = "100"
+seed!(42)
 
 const GROUP_SIZE = 256
 const Nspins     = 129
-const Nt         = 256
-const dt         = 1.0f-5
+const Nt         = 300 #  Nt*dt = 3ms    
+const dt         = 1.0f-5 # 10 µs
 const γ          = Float32(2π) * 42.58f6
-const N_Spins32 = Int32(Nspins)
-const N_Δt32    = Int32(Nt)
+const N_Spins32  = Int32(Nspins)
+const N_Δt32     = Int32(Nt)
 
-# segmented RF
-const NUM_TIME_SEGMENTS = 50
+const NUM_TIME_SEGMENTS = 200
 const INV_SEG_DUR = NUM_TIME_SEGMENTS / (Nt*dt)
 
-# slew-limited Gz
-const MAX_GZ   = 10.0f-3     # T/m
-const MAX_SLEW = 70.0f0      # T/m/s
-@inline function gz_at(t; Gmax=MAX_GZ, slew=MAX_SLEW)
-    Ttot = Nt*dt
-    ramp_time = min(Gmax/slew, Ttot/2)
-    if 2ramp_time == Ttot
-        Gpeak = slew * ramp_time
-        return t <= ramp_time ? (t/ramp_time)*Gpeak :
-               t >= Ttot - ramp_time ? ((Ttot - t)/ramp_time)*Gpeak : Gpeak
-    elseif 2ramp_time < Ttot
-        return t < ramp_time ? (t/ramp_time)*Gmax :
-               t <= Ttot - ramp_time ? Gmax :
-               ((Ttot - t)/ramp_time)*Gmax
-    else
-        Gpeak = slew * ramp_time
-        return t <= ramp_time ? (t/ramp_time)*Gpeak :
-                                ((Ttot - t)/ramp_time)*Gpeak
-    end
-end
-
-backend = CUDA.CUDABackend()
-seed!(42)
-
-M_xy_h = zeros(Float32, 2Nspins)
-M_z_h  = zeros(Float32, Nspins)
-
-p_x_h   = zeros(Float32, Nspins)
-p_y_h   = zeros(Float32, Nspins)
+const BW_CUTOFF = 2.5f-3
+const BW_ORDER  = 16       
 
 const half_FOVz = 10.0f-3
-p_z_h = collect(LinRange(-half_FOVz, half_FOVz, Nspins)) .|> Float32
-p_ΔBz_h = zeros(Float32, Nspins)
-p_T1_h  = fill(1.0f0, Nspins)
-p_T2_h  = fill(0.5f0, Nspins)
-p_ρ_h   = fill(1.0f0, Nspins)
+const voxel_resolution = (2 * half_FOVz) / (Nspins - 1)
+const position_offset_range = voxel_resolution / 4
 
-s_Gx_h  = zeros(Float32, Nt)
-s_Gy_h  = zeros(Float32, Nt)
-s_Gz_h  = [gz_at((k-1)*dt) for k in 1:Nt] .|> Float32
-s_Δt_h  = fill(dt, Nt)
-s_Δf_h  = zeros(Float32, Nt)
-s_B1r_h = fill(1.0f-6, Nt)
-s_B1i_h = zeros(Float32, Nt)
+const MAX_GZ   = 10.0f-3   
+const MAX_SLEW = 70.0f0   
 
-const box_halfwidth = 2.5f-3
-target_mag_h = map(z -> abs(z) <= box_halfwidth ? 1.0f0 : 0.0f0, p_z_h) |> collect
+const RF_BOUND = 12.0f-6
+const λ_power  = 1.0f-3
+const λ_smooth = 0.2f0
 
-# pass/stop masks (metrics only)
-const CORE = box_halfwidth
-in_core_h = (@. -CORE <= p_z_h <= CORE)
-in_stop_h = .!(@. -box_halfwidth <= p_z_h <= box_halfwidth)
+@inline function gz_at(t; Gmax=MAX_GZ, slew=MAX_SLEW)
+    Ttot = Nt * dt
+    ramp_time = min(Gmax / slew, Ttot / 2)
 
-M_xy   = adapt(backend, M_xy_h)
-M_z    = adapt(backend, M_z_h)
-p_x    = adapt(backend, p_x_h)
-p_y    = adapt(backend, p_y_h)
-p_z    = adapt(backend, p_z_h)
-p_ΔBz  = adapt(backend, p_ΔBz_h)
-p_T1   = adapt(backend, p_T1_h)
-p_T2   = adapt(backend, p_T2_h)
-p_ρ    = adapt(backend, p_ρ_h)
-s_Gx   = adapt(backend, s_Gx_h)
-s_Gy   = adapt(backend, s_Gy_h)
-s_Gz   = adapt(backend, s_Gz_h)
-s_Δt   = adapt(backend, s_Δt_h)
-s_Δf   = adapt(backend, s_Δf_h)
-s_B1r  = adapt(backend, s_B1r_h)
-s_B1i  = adapt(backend, s_B1i_h)
-target_mag = adapt(backend, target_mag_h)
-
-RF_I = 1.0f-6 .* (2rand(Float32, NUM_TIME_SEGMENTS) .- 1.0f0)
-RF_Q = zeros(Float32, NUM_TIME_SEGMENTS)
-
-function upsample_rf!(s_B1r::CUDA.CuArray{Float32,1}, s_B1i::CUDA.CuArray{Float32,1},
-    I::Vector{Float32}, Q::Vector{Float32})
-        r = Vector{Float32}(undef, Nt)
-        i = Vector{Float32}(undef, Nt)
-
-        @inbounds for k in 1:Nt
-            t = (k-1)*dt
-            s   = clamp(t*INV_SEG_DUR, 0.0f0, NUM_TIME_SEGMENTS - 1.0f-6)
-            i1  = clamp(Int(floor(s)) + 1, 1, NUM_TIME_SEGMENTS - 1)
-            i2  = i1 + 1
-            α   = s - (i1 - 1)
-            r[k] = I[i1]*(1.0f0-α) + I[i2]*α
-            i[k] = Q[i1]*(1.0f0-α) + Q[i2]*α
+    if 2 * ramp_time == Ttot
+        Gpeak = slew * ramp_time
+        if t <= ramp_time
+            return (t / ramp_time) * Gpeak
+        elseif t >= Ttot - ramp_time
+            return ((Ttot - t) / ramp_time) * Gpeak
+        else
+            return Gpeak
         end
-
-        copyto!(s_B1r, r)
-        copyto!(s_B1i, i)
-
-        return nothing
-end
-
-function accumulate_seg_grads!(gI::Vector{Float32}, gQ::Vector{Float32},
-                               dB1r::CUDA.CuArray{Float32,1}, dB1i::CUDA.CuArray{Float32,1})
-    hgr = Array(dB1r); hgi = Array(dB1i)
-    fill!(gI, 0.0f0); fill!(gQ, 0.0f0)
-    @inbounds for k in 1:Nt
-        t  = (k-1)*dt
-        s  = clamp(t*INV_SEG_DUR, 0.0f0, NUM_TIME_SEGMENTS - 1.0f-6)
-        i1 = clamp(Int(floor(s)) + 1, 1, NUM_TIME_SEGMENTS - 1)
-        i2 = i1 + 1
-        α  = s - (i1 - 1)
-        w1 = (1.0f0 - α) * dt
-        w2 = α * dt
-        gI[i1] += w1 * hgr[k]; gI[i2] += w2 * hgr[k]
-        gQ[i1] += w1 * hgi[k]; gQ[i2] += w2 * hgi[k]
+    elseif 2 * ramp_time < Ttot
+        if t < ramp_time
+            return (t / ramp_time) * Gmax
+        elseif t <= Ttot - ramp_time
+            return Gmax
+        else
+            return ((Ttot - t) / ramp_time) * Gmax
+        end
+    else
+        Gpeak = slew * ramp_time
+        if t <= ramp_time
+            return (t / ramp_time) * Gpeak
+        else
+            return ((Ttot - t) / ramp_time) * Gpeak
+        end
     end
-    invT = 1.0f0 / (Nt*dt)
-    @. gI *= invT
-    @. gQ *= invT
-    return nothing
 end
 
+p_z_base_h = collect(LinRange(-half_FOVz, half_FOVz, Nspins)) .|> Float32
 
-@kernel unsafe_indices=true inbounds=true function excitation_kernel!(
+function butterworth_target(z::Vector{Float32}; cutoff::Float32=BW_CUTOFF, n::Int=BW_ORDER)
+    r = abs.(z) ./ cutoff
+    return 1f0 ./ sqrt.(1f0 .+ (r .^ (2n)))
+end
+
+function make_target_and_masks(z::Vector{Float32})
+    target_mag = butterworth_target(z; cutoff=BW_CUTOFF, n=BW_ORDER)
+
+    in_core = Float32.(target_mag .> 0.5f0)
+    in_stop = Float32.(target_mag .< 0.05f0)
+
+    return in_core, in_stop, target_mag
+end
+
+M_xy   = adapt(backend, zeros(Float32, 2Nspins))
+M_z    = adapt(backend, zeros(Float32, Nspins))
+p_x    = adapt(backend, zeros(Float32, Nspins))
+p_y    = adapt(backend, zeros(Float32, Nspins))
+p_z    = adapt(backend, copy(p_z_base_h))
+p_ΔBz  = adapt(backend, zeros(Float32, Nspins))
+p_T1   = adapt(backend, fill(1.0f0, Nspins))
+p_T2   = adapt(backend, fill(0.5f0, Nspins))
+p_ρ    = adapt(backend, fill(1.0f0, Nspins))
+s_Gx   = adapt(backend, zeros(Float32, Nt))
+s_Gy   = adapt(backend, zeros(Float32, Nt))
+s_Gz   = adapt(backend, [gz_at((k-1)*dt) for k in 1:Nt] .|> Float32)
+s_Δt   = adapt(backend, fill(dt, Nt))
+s_Δf   = adapt(backend, zeros(Float32, Nt))
+s_B1r  = adapt(backend, fill(1.0f-6, Nt))  # time upsamled version
+s_B1i  = adapt(backend, zeros(Float32, Nt))
+
+function init_rf_gaussian(nseg::Int)
+    tgrid = collect(range(0.0f0, Nt*dt, length=nseg))
+    tmid = (Nt*dt)/2
+    σ = (Nt*dt) / 7.5f0
+
+    envelope = exp.(-(0.5f0 .* ((tgrid .- tmid) ./ σ).^2))
+
+    θ = deg2rad(90.0f0)
+    dt_seg = (Nt*dt) / (nseg - 1)
+
+    area = sum(abs.(envelope)) * dt_seg
+    scale = (θ / γ) / area
+
+    I = clamp.(envelope .* scale * 0.3f0, -RF_BOUND*0.8f0, RF_BOUND*0.8f0)
+    Q = zeros(Float32, length(I))
+    return I, Q
+end
+
+RF_I_h, RF_Q_h = init_rf_gaussian(NUM_TIME_SEGMENTS)
+seg_I_dev = adapt(backend, similar(RF_I_h))
+seg_Q_dev = adapt(backend, similar(RF_Q_h))
+
+
+@inline function cubic_weights_scalar(α::Float32)
+    t=α
+    t2=t*t
+    t3=t2*t
+
+    w0 = -0.5f0*t + t2 - 0.5f0*t3
+    w1 = 1.0f0   - 2.5f0*t2 + 1.5f0*t3
+    w2 = 0.5f0*t + 2.0f0*t2 - 1.5f0*t3
+    w3 = -0.5f0*t2 + 0.5f0*t3
+
+    return w0, w1, w2, w3
+end
+
+function precompute_catmull_rom(Nt::Int, Nseg::Int, dt::Float32, inv_seg_dur::Float32)
+    i0 = Array{Int32}(undef, Nt)
+    i1 = similar(i0)
+    i2 = similar(i0)
+    i3 = similar(i0)
+
+    w0 = Array{Float32}(undef, Nt)
+    w1 = similar(w0)
+    w2 = similar(w0)
+    w3 = similar(w0)
+
+    @inbounds for ksample in 1:Nt
+        t = Float32(ksample-1)*dt
+        s = clamp(t*inv_seg_dur, 0.0f0, Float32(Nseg - 1) - 1f-6)
+        k = clamp(Int(floor(s)), 1, Nseg - 3)
+        α = Float32(s - k)
+
+        i0[ksample] = Int32(k)
+        i1[ksample] = Int32(k+1)
+        i2[ksample] = Int32(k+2)
+        i3[ksample] = Int32(k+3)
+
+        w0[ksample], w1[ksample], w2[ksample], w3[ksample] = cubic_weights_scalar(α)
+    end
+    return i0, i1, i2, i3, w0, w1, w2, w3
+end
+
+i0_h, i1_h, i2_h, i3_h, w0_h, w1_h, w2_h, w3_h = precompute_catmull_rom(Nt, NUM_TIME_SEGMENTS, dt, INV_SEG_DUR)
+d_i0 = adapt(backend, i0_h)
+d_i1 = adapt(backend, i1_h)
+d_i2 = adapt(backend, i2_h)
+d_i3 = adapt(backend, i3_h)
+d_w0 = adapt(backend, w0_h)
+d_w1 = adapt(backend, w1_h)
+d_w2 = adapt(backend, w2_h)
+d_w3 = adapt(backend, w3_h)
+
+@kernel function upsample_kernel!(B1r_t, B1i_t, I, Q, i0,i1,i2,i3, w0,w1,w2,w3)
+    k = Int(Tuple(@index(Global))[1])
+    B1r_t[k] = w0[k]*I[i0[k]] + w1[k]*I[i1[k]] + w2[k]*I[i2[k]] + w3[k]*I[i3[k]]
+    B1i_t[k] = w0[k]*Q[i0[k]] + w1[k]*Q[i1[k]] + w2[k]*Q[i2[k]] + w3[k]*Q[i3[k]]
+end
+
+@kernel function adjoint_kernel!(gI, gQ, dB1r_t, dB1i_t, i0,i1,i2,i3, w0,w1,w2,w3, scale::Float32)
+    k = Int(Tuple(@index(Global))[1])
+
+    gr = dB1r_t[k]*scale
+    gi = dB1i_t[k]*scale
+
+    Atomix.@atomic gI[Int(i0[k])] += w0[k]*gr
+    Atomix.@atomic gI[Int(i1[k])] += w1[k]*gr
+    Atomix.@atomic gI[Int(i2[k])] += w2[k]*gr
+    Atomix.@atomic gI[Int(i3[k])] += w3[k]*gr
+    Atomix.@atomic gQ[Int(i0[k])] += w0[k]*gi
+    Atomix.@atomic gQ[Int(i1[k])] += w1[k]*gi
+    Atomix.@atomic gQ[Int(i2[k])] += w2[k]*gi
+    Atomix.@atomic gQ[Int(i3[k])] += w3[k]*gi
+end
+
+function device_upsample!(B1r_t, B1i_t, I_dev, Q_dev)
+    upsample_kernel!(backend, GROUP_SIZE)(B1r_t, B1i_t, I_dev, Q_dev,
+        d_i0,d_i1,d_i2,d_i3, d_w0,d_w1,d_w2,d_w3; ndrange=Nt)
+end
+
+function device_adjoint_to_segments!(gI_dev, gQ_dev, dB1r_t, dB1i_t; scale=dt)
+    fill!(gI_dev, 0f0); fill!(gQ_dev, 0f0)
+    adjoint_kernel!(backend, GROUP_SIZE)(gI_dev, gQ_dev, dB1r_t, dB1i_t,
+        d_i0,d_i1,d_i2,d_i3, d_w0,d_w1,d_w2,d_w3, Float32(scale); ndrange=Nt)
+end
+
+@kernel inbounds=true function excitation_kernel!(
     M_xy::AbstractVector{T}, M_z::AbstractVector{T},
     p_x::AbstractVector{T}, p_y::AbstractVector{T}, p_z::AbstractVector{T},
     p_ΔBz::AbstractVector{T}, p_T1::AbstractVector{T}, p_T2::AbstractVector{T}, p_ρ::AbstractVector{T},
@@ -148,12 +224,14 @@ end
     s_Δt::AbstractVector{T}, s_Δf::AbstractVector{T}, s_B1r::AbstractVector{T}, s_B1i::AbstractVector{T},
     N_Spins::Int32, N_Δt::Int32
 ) where {T}
-    i = Int(@index(Global, Linear))
+    i = Int(Tuple(@index(Global))[1])
     if i <= Int(N_Spins)
         N   = Int(N_Spins)
         ir  = i
         ii  = i + N
-        x   = p_x[i];  y = p_y[i];  z = p_z[i]
+        x   = p_x[i]
+        y = p_y[i]
+        z = p_z[i]
         ΔBz = p_ΔBz[i]
         ρ   = p_ρ[i]
         T1  = p_T1[i]
@@ -163,14 +241,18 @@ end
         Mz    = M_z[i]
         s_idx = 1
         @inbounds while s_idx <= Int(N_Δt)
-            gx  = s_Gx[s_idx]; gy = s_Gy[s_idx]; gz = s_Gz[s_idx]
+            gx  = s_Gx[s_idx]
+            gy = s_Gy[s_idx]
+            gz = s_Gz[s_idx]
             Δt  = s_Δt[s_idx]
             df  = s_Δf[s_idx]
-            b1r = s_B1r[s_idx]; b1i = s_B1i[s_idx]
+            b1r = s_B1r[s_idx]
+            b1i = s_B1i[s_idx]
             Bz = (x*gx + y*gy + z*gz) + ΔBz - df / T(γ)
             B  = sqrt(b1r*b1r + b1i*b1i + Bz*Bz)
             ϕ  = T(γ) * B * Δt
-            sϕ = sin(ϕ); cϕ = cos(ϕ)
+            sϕ = sin(ϕ)
+            cϕ = cos(ϕ)
             denom = B + T(1.0f-20)
             α_r =  cϕ
             α_i = -(Bz/denom) * sϕ
@@ -199,47 +281,16 @@ function excitation_caller!(M_xy, M_z,
     p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
     N_Spins::Int32, N_Δt::Int32, backend)
-    k = excitation_kernel!(backend, GROUP_SIZE)
+
+    k = excitation_kernel!(backend)
     k(M_xy, M_z,
       p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
       s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-      N_Spins, N_Δt; ndrange=Int(N_Spins))
+      N_Spins, N_Δt;
+      ndrange=Int(N_Spins),
+      workgroupsize=GROUP_SIZE)
     return nothing
 end
-
-@kernel function mag_loss_grad_M!(dM, M, TGTmag::AbstractVector{Float32})
-    i = @index(Global, Linear)
-    N = length(TGTmag)
-    if i <= N
-        ir = i; ii = i + N
-        @inbounds begin
-            mr = M[ir]; mi = M[ii]
-            mag = sqrt(mr*mr + mi*mi)
-            e   = mag - TGTmag[i]          # mean-squared: L = mean(e^2)
-            if mag < 1.0f-12
-                # subgradient pointing along 45° when mag≈0
-                g = 2.0f0 * e / Float32(N)
-                dM[ir] = g * 0.70710677f0
-                dM[ii] = g * 0.70710677f0
-            else
-                invmag = 1.0f0 / mag
-                gfac = (2.0f0 * e / Float32(N)) * invmag
-                dM[ir] = gfac * mr
-                dM[ii] = gfac * mi
-            end
-        end
-    end
-end
-
-function gpu_loss_mag(M_xy::CUDA.CuArray{T}, target_mag::CUDA.CuArray{T}) where {T<:AbstractFloat}
-    N = length(target_mag)
-    Mr = view(M_xy, 1:N)
-    Mi = view(M_xy, N+1:2N)
-    mag = sqrt.(Mr .* Mr .+ Mi .* Mi .+ T(1.0f-20))
-    err = mag .- target_mag
-    return CUDA.sum(err .* err) / T(N)   # ← mean, not sum
-end
-
 
 Base.@noinline function excite_only!(
     M_xy, M_z,
@@ -254,168 +305,370 @@ Base.@noinline function excite_only!(
     return nothing
 end
 
-function grad_rf!(
-    ∇B1r::CUDA.CuArray{Float32}, ∇B1i::CUDA.CuArray{Float32},
-    M_xy, M_z,
-    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
-    s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-    target_mag,
-    backend,
+@kernel function mag_loss_grad_M!(
+    dM::AbstractVector{Float32}, M::AbstractVector{Float32},
+    in_core::AbstractVector{Float32}, in_stop::AbstractVector{Float32},
+    λ_core::Float32, λ_stop::Float32, target_mag::AbstractVector{Float32}
 )
-    fill!(M_xy, 0.0f0); fill!(M_z, 1.0f0)
+    i = Int(Tuple(@index(Global))[1])
+    N = length(in_core)
+    if i <= N
+        ir = i
+        ii = i + N
+        Mx = M[ir]
+        My = M[ii]
+        mag2 = Mx*Mx + My*My
+        tgt  = target_mag[i]
+        mag  = sqrt(mag2 + 1f-12)
+
+        n_core = max(sum(in_core), 1f-12)
+        n_stop = max(sum(in_stop), 1f-12)
+
+        if in_core[i] > 0.5f0
+            e = (mag - tgt)
+            s = (λ_core / n_core) * (e / max(mag, 1f-12)) 
+            dM[ir] = s * Mx
+            dM[ii] = s * My
+        elseif in_stop[i] > 0.5f0
+            s = (2f0 * λ_stop) / n_stop                  
+            dM[ir] = s * Mx
+            dM[ii] = s * My
+        else
+            dM[ir] = 0f0; dM[ii] = 0f0
+        end
+    end
+end
+
+function gpu_loss_mag(M_xy,
+                      in_core, in_stop, target_mag;
+                      λ_core::Float32 = 1f0, λ_stop::Float32 = 1f0)
+    N  = length(in_core)
+    Mx = view(M_xy, 1:N)
+    My = view(M_xy, N+1:2N)
+
+    mag = sqrt.(Mx .* Mx .+ My .* My .+ 1f-12)
+
+    n_core = CUDA.sum(in_core) + 1f-12
+    n_stop = CUDA.sum(in_stop) + 1f-12
+
+    loss_core = λ_core * CUDA.sum(((mag .- target_mag).^2) .* in_core) / n_core
+    loss_stop = λ_stop * CUDA.sum((Mx .* Mx .+ My .* My) .* in_stop) / n_stop
+    return Float32(loss_core + loss_stop)
+end
+
+struct Batch
+    NSC::Int
+    z_scen::Vector{Vector{Float32}}
+    in_core_dev::Vector             
+    in_stop_dev::Vector
+    target_dev::Vector             
+end
+
+function make_scenarios(NSC::Int, jitter::Float32)
+    zs_host = Vector{Vector{Float32}}(undef, NSC)
+    core_dev = Vector{Any}(undef, NSC)
+    stop_dev = Vector{Any}(undef, NSC)
+    tgt_dev  = Vector{Any}(undef, NSC)
+
+    for s in 1:NSC
+        pert = (rand(Float32, Nspins) .- 0.5f0) .* (2f0 * position_offset_range * jitter)
+        z = p_z_base_h .+ pert
+        zs_host[s] = z
+        in_core_h, in_stop_h, tgt_h = make_target_and_masks(z)
+        core_dev[s] = adapt(backend, in_core_h)
+        stop_dev[s] = adapt(backend, in_stop_h)
+        tgt_dev[s]  = adapt(backend, tgt_h)
+    end
+    return Batch(NSC, zs_host, core_dev, stop_dev, tgt_dev)
+end
+
+function add_rf_regs!(gI::AbstractVector{Float32}, gQ::AbstractVector{Float32},
+                      I::AbstractVector{Float32}, Q::AbstractVector{Float32})
+    n = length(I)
+    @. gI += (2.0f0*λ_power/n) * I
+    @. gQ += (2.0f0*λ_power/n) * Q
+
+    if n > 1 && λ_smooth != 0.0f0
+        gI[1] += λ_smooth*(I[1]-I[2])
+
+        for k in 2:n-1
+            gI[k] += λ_smooth*(2.0f0*I[k] - I[k-1] - I[k+1])
+        end
+
+        gI[n] += λ_smooth*(I[n]-I[n-1])
+        gQ[1] = λ_smooth*(Q[1]-Q[2])
+
+        for k in 2:n-1
+            gQ[k] += λ_smooth*(2.0f0*Q[k] - Q[k-1] - Q[k+1])
+        end
+
+        gQ[n] += λ_smooth*(Q[n]-Q[n-1])
+    end
+    return nothing
+end
+
+function rf_reg_value(I::AbstractVector{Float32}, Q::AbstractVector{Float32})
+    n = length(I)
+    pwr = λ_power/Float32(n) * (sum(@. I*I) + sum(@. Q*Q))
+    smi = 0.0f0
+    smq = 0.0f0
+
+    @inbounds for k in 1:n-1
+        di = I[k] - I[k+1]
+        dq = Q[k] - Q[k+1]
+        smi += di*di
+        smq += dq*dq
+    end
+
+    sm = 0.5f0*λ_smooth*(smi + smq)
+    return pwr + sm
+end
+
+# temps
+dM_xy_buf = similar(M_xy)
+dM_z_buf = similar(M_z)
+tmp_dB1r = similar(s_B1r)
+tmp_dB1i = similar(s_B1i)
+∇B1r = similar(s_B1r)
+∇B1i = similar(s_B1i)
+gI_dev = adapt(backend, zeros(Float32, NUM_TIME_SEGMENTS))
+gQ_dev = adapt(backend, zeros(Float32, NUM_TIME_SEGMENTS))
+
+function forward_excitation!(z_host, in_core_dev, in_stop_dev, target_dev)
+    copyto!(p_z, z_host)
+    device_upsample!(s_B1r, s_B1i, seg_I_dev, seg_Q_dev)
+
+    fill!(M_xy, 0.0f0)
+    fill!(M_z, 1.0f0)
     excite_only!(M_xy, M_z,
         p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
         s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
         backend)
-    KernelAbstractions.synchronize(backend)
 
-    dM_xy = similar(M_xy)
-    mag_loss_grad_M!(backend, GROUP_SIZE)(dM_xy, M_xy, target_mag; ndrange=Int(length(target_mag)))
     KernelAbstractions.synchronize(backend)
-
-    dM_z = similar(M_z);  fill!(dM_z, 0.0f0)
-    dΔt  = similar(s_Δt); fill!(dΔt,  0.0f0)
-    dΔf  = similar(s_Δf); fill!(dΔf,  0.0f0)
-    fill!(∇B1r, 0.0f0); fill!(∇B1i, 0.0f0)
-
-    Enzyme.autodiff(Enzyme.Reverse, excite_only!,
-        Enzyme.Duplicated(M_xy, dM_xy),
-        Enzyme.Duplicated(M_z,  dM_z),
-        Enzyme.Const(p_x), Enzyme.Const(p_y), Enzyme.Const(p_z),
-        Enzyme.Const(p_ΔBz), Enzyme.Const(p_T1), Enzyme.Const(p_T2), Enzyme.Const(p_ρ),
-        Enzyme.Const(s_Gx), Enzyme.Const(s_Gy), Enzyme.Const(s_Gz),
-        Enzyme.Duplicated(s_Δt, dΔt),
-        Enzyme.Duplicated(s_Δf, dΔf),
-        Enzyme.Duplicated(s_B1r, ∇B1r),
-        Enzyme.Duplicated(s_B1i, ∇B1i),
-        Enzyme.Const(backend),
-    )
-    KernelAbstractions.synchronize(backend)
-    return gpu_loss_mag(M_xy, target_mag)
+    return gpu_loss_mag(M_xy, in_core_dev, in_stop_dev, target_dev)
 end
 
-mutable struct AdamWState
-    t::Int
-    mI::Vector{Float32}
-    vI::Vector{Float32}
-    mQ::Vector{Float32}
-    vQ::Vector{Float32}
-end
+function loss_only_batched!(θ::Vector{Float32}, batch::Batch)
+    copyto!(seg_I_dev, 1, θ, 1, NUM_TIME_SEGMENTS)
+    copyto!(seg_Q_dev, 1, θ, NUM_TIME_SEGMENTS+1, NUM_TIME_SEGMENTS)
 
-function adamw_step_segments!(
-    I, Q, gI, gQ, st::AdamWState;
-    lr::Float32=3.0f-3, beta1::Float32=0.9f0, beta2::Float32=0.999f0,
-    eps::Float32=1.0f-8, weight_decay::Float32=1.0f-4
-)
-    st.t += 1
-    @. st.mI = beta1*st.mI + (1.0f0-beta1)*gI
-    @. st.vI = beta2*st.vI + (1.0f0-beta2)*(gI*gI)
-    @. st.mQ = beta1*st.mQ + (1.0f0-beta1)*gQ
-    @. st.vQ = beta2*st.vQ + (1.0f0-beta2)*(gQ*gQ)
-    b1t = 1.0f0 - beta1^st.t
-    b2t = 1.0f0 - beta2^st.t
-    @. I = (1.0f0 - lr*weight_decay)*I
-    @. Q = (1.0f0 - lr*weight_decay)*Q
-    invI = 1.0f0 ./ (sqrt.(st.vI ./ b2t) .+ eps)
-    invQ = 1.0f0 ./ (sqrt.(st.vQ ./ b2t) .+ eps)
-    @. I = I - lr * ((st.mI / b1t) * invI)
-    @. Q = Q - lr * ((st.mQ / b1t) * invQ)
-    return nothing
-end
-
-function clip_seg_grad!(gI, gQ, clip::Float32)
-    nrm = sqrt(sum(@. gI*gI + gQ*gQ))
-    if nrm > clip
-        sc = clip/nrm
-        @. gI *= sc; @. gQ *= sc
+    Lacc = 0.0f0
+    @inbounds for s in 1:batch.NSC
+        Lacc += forward_excitation!(batch.z_scen[s], batch.in_core_dev[s], batch.in_stop_dev[s], batch.target_dev[s])
     end
+    return Lacc / Float32(batch.NSC) + rf_reg_value(view(θ, 1:NUM_TIME_SEGMENTS),
+                                                    view(θ, NUM_TIME_SEGMENTS+1:2NUM_TIME_SEGMENTS))
 end
 
-# RF regularizers (segments)
-const RF_BOUND  = 12.0f-6
-const λ_power   = 1.0f3     # was 1e4
-const λ_smooth  = 1.0f6     # was 1e10
+function loss_and_grad_batched!(θ::Vector{Float32}, batch::Batch)
+    copyto!(seg_I_dev, 1, θ, 1, NUM_TIME_SEGMENTS)
+    copyto!(seg_Q_dev, 1, θ, NUM_TIME_SEGMENTS+1, NUM_TIME_SEGMENTS)
 
-function add_rf_regs!(gI, gQ, I, Q)
-    n = length(I)
-    @. gI += (λ_power/n) * I
-    @. gQ += (λ_power/n) * Q
-    if n > 1 && λ_smooth != 0.0f0
-        gI[1]     += 2.0f0*λ_smooth*(I[1]-I[2])
-        for k in 2:n-1
-            gI[k] += 2.0f0*λ_smooth*(2.0f0*I[k] - I[k-1] - I[k+1])
-        end
-        gI[n]     += 2.0f0*λ_smooth*(I[n]-I[n-1])
-        gQ[1]     += 2.0f0*λ_smooth*(Q[1]-Q[2])
-        for k in 2:n-1
-            gQ[k] += 2.0f0*λ_smooth*(2.0f0*Q[k] - Q[k-1] - Q[k+1])
-        end
-        gQ[n]     += 2.0f0*λ_smooth*(Q[n]-Q[n-1])
+    fill!(∇B1r, 0f0)
+    fill!(∇B1i, 0f0)
+    Lacc = 0.0f0
+
+    @inbounds for s in 1:batch.NSC
+        Ls = forward_excitation!(batch.z_scen[s], batch.in_core_dev[s], batch.in_stop_dev[s], batch.target_dev[s])
+        Lacc += Ls
+
+        fill!(dM_xy_buf, 0f0)
+        mag_loss_grad_M!(backend, GROUP_SIZE)(
+            dM_xy_buf, M_xy, batch.in_core_dev[s], batch.in_stop_dev[s], 1f0, 1f0, batch.target_dev[s];
+            ndrange=Int(Nspins))
+
+        fill!(tmp_dB1r, 0f0)
+        fill!(tmp_dB1i, 0f0)
+        fill!(dM_z_buf, 0f0)
+        Enzyme.autodiff(Enzyme.Reverse, excite_only!,
+            Enzyme.Duplicated(M_xy, dM_xy_buf),
+            Enzyme.Duplicated(M_z,  dM_z_buf),
+            Enzyme.Const(p_x), Enzyme.Const(p_y), Enzyme.Const(p_z),
+            Enzyme.Const(p_ΔBz), Enzyme.Const(p_T1), Enzyme.Const(p_T2), Enzyme.Const(p_ρ),
+            Enzyme.Const(s_Gx), Enzyme.Const(s_Gy), Enzyme.Const(s_Gz),
+            Enzyme.Const(s_Δt),
+            Enzyme.Const(s_Δf),
+            Enzyme.Duplicated(s_B1r, tmp_dB1r),
+            Enzyme.Duplicated(s_B1i, tmp_dB1i),
+            Enzyme.Const(backend),
+        )
+        KernelAbstractions.synchronize(backend)
+
+        @. ∇B1r += tmp_dB1r
+        @. ∇B1i += tmp_dB1i
     end
+
+    invNSC = 1f0 / Float32(batch.NSC)
+    @. ∇B1r *= invNSC
+    @. ∇B1i *= invNSC
+    L_data = Lacc * invNSC
+
+    device_adjoint_to_segments!(gI_dev, gQ_dev, ∇B1r, ∇B1i; scale=dt)
+    gI = Array(gI_dev)
+    gQ = Array(gQ_dev)
+
+    Iview = view(θ, 1:NUM_TIME_SEGMENTS)
+    Qview = view(θ, NUM_TIME_SEGMENTS+1:2NUM_TIME_SEGMENTS)
+    add_rf_regs!(gI, gQ, Iview, Qview)
+    L = L_data + rf_reg_value(Iview, Qview)
+
+    return L, vcat(gI, gQ)
 end
 
-∇B1r = similar(s_B1r);  ∇B1i = similar(s_B1i)
-
-function evaluate_and_grad!(target_mag)
-    upsample_rf!(s_B1r, s_B1i, RF_I, RF_Q)
-    L = grad_rf!(∇B1r, ∇B1i,
-                 M_xy, M_z,
-                 p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
-                 s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-                 target_mag, backend)
-    KernelAbstractions.synchronize(backend)
-    return Float32(L)
+@inline function project_box!(θ::Vector{Float32}, bnd::Float32)
+    @inbounds @simd for i in eachindex(θ)
+        x = θ[i]
+        θ[i] = ifelse(x >  bnd, bnd, ifelse(x < -bnd, -bnd, x))
+    end
+    return θ
 end
 
-function run_adamw!(num_iters::Int=300; lr=3.0f-3, beta1=0.9f0, beta2=0.999f0,
-                    eps=1.0f-8, weight_decay=1.0f-4, grad_clip=5.0f1)
-    st = AdamWState(0, zeros(Float32, NUM_TIME_SEGMENTS), zeros(Float32, NUM_TIME_SEGMENTS),
-                       zeros(Float32, NUM_TIME_SEGMENTS), zeros(Float32, NUM_TIME_SEGMENTS))
-    gI = similar(RF_I); gQ = similar(RF_Q)
-    cur_lr = lr; clip_hits = 0
-
-    losses = Vector{Float32}(undef, num_iters)
-    grad_hist = similar(losses)
-    lr_hist = similar(losses)
-
-    @info "Starting AdamW" iters=num_iters lr=lr
-    for it in 1:num_iters
-        L = evaluate_and_grad!(target_mag)
-        accumulate_seg_grads!(gI, gQ, ∇B1r, ∇B1i)
-        add_rf_regs!(gI, gQ, RF_I, RF_Q)
-
-        gn = sqrt(sum(@. gI*gI + gQ*gQ))
-        if gn > grad_clip
-            sc = grad_clip/gn
-            @. gI *= sc; @. gQ *= sc
-            clip_hits += 1
-        else
-            clip_hits = max(clip_hits - 1, 0)
+@inline function cap_inf!(dθ::Vector{Float32}, maxstep::Float32)
+    m = maximum(abs, dθ)
+    if m > maxstep
+        s = maxstep / m
+        @inbounds @simd for i in eachindex(dθ)
+            dθ[i] *= s
         end
-        if clip_hits >= 3
-            cur_lr *= 0.5f0
-            clip_hits = 0
-        end
+    end
+    return dθ
+end
 
-        adamw_step_segments!(RF_I, RF_Q, gI, gQ, st; lr=cur_lr, beta1=beta1, beta2=beta2, eps=eps, weight_decay=weight_decay)
-        @. RF_I = clamp(RF_I, -RF_BOUND, RF_BOUND)
-        @. RF_Q = clamp(RF_Q, -RF_BOUND, RF_BOUND)
+function run_spg_bb!(θ::Vector{Float32}, batch::Batch;
+    max_iters::Int=150, m_hist::Int=10, c::Float32=1f-4, beta::Float32=0.5f0,
+    step_cap::Float32=0.15f0*RF_BOUND, α_min::Float32=1f-6, α_max::Float32=1f3,
+    grad_tol::Float32=1f-6, loss_tol_rel::Float32=5f-4, patience::Int=15)
 
+    L, g = loss_and_grad_batched!(θ, batch)
+
+    loss_win = fill(L, m_hist)
+    win_len  = 1
+    θ_prev = copy(θ)
+    g_prev = copy(g)
+    α = 1f-2
+    best_L = L
+    stall  = 0
+
+    losses = Vector{Float32}(undef, max_iters)
+    @info "Starting optimization" max_iters=max_iters m_hist=m_hist
+
+    dθ = similar(θ)
+    θ_trial = similar(θ)
+
+    for it in 1:max_iters
+        gnorm = maximum(abs, g)
         losses[it] = L
-        grad_hist[it] = gn
-        lr_hist[it] = cur_lr
-        @info "iter" it=it L=L grad_norm=gn lr=cur_lr
+        if gnorm <= grad_tol
+            @info "Converged (grad_tol)" it=it L=L grad=gnorm
+            return θ, L, losses[1:it]
+        end
+
+        sTy = 0.0f0
+        yTy = 0.0f0
+        @inbounds @simd for i in eachindex(θ)
+            s = θ[i] - θ_prev[i]
+            y = g[i] - g_prev[i]
+            sTy += s*y
+            yTy += y*y
+        end
+        α = (yTy > 0f0 && sTy > 0f0) ? clamp(sTy / yTy, α_min, α_max) : clamp(1f-2 / (1f0 + gnorm), α_min, α_max)
+
+        # Trial step
+        @inbounds @simd for i in eachindex(θ) 
+            dθ[i] = -α * g[i] 
+        end
+        cap_inf!(dθ, step_cap)
+
+        @inbounds @simd for i in eachindex(θ) 
+            θ_trial[i] = θ[i] + dθ[i] 
+        end
+        project_box!(θ_trial, RF_BOUND)
+
+        # Armijo backtrack
+        gTd = 0.0f0
+        @inbounds @simd for i in eachindex(θ) 
+            gTd += g[i] * (θ_trial[i] - θ[i]) 
+        end
+
+        f_ref = maximum(view(loss_win, 1:win_len))
+        n_back = 0
+        L_trial = loss_only_batched!(θ_trial, batch)
+        
+        while L_trial > f_ref + c * gTd && n_back < 8
+            @inbounds @simd for i in eachindex(dθ) 
+                dθ[i] *= beta 
+            end
+
+            cap_inf!(dθ, step_cap)
+            @inbounds @simd for i in eachindex(θ_trial) 
+                θ_trial[i] = θ[i] + dθ[i] 
+            end
+
+            project_box!(θ_trial, RF_BOUND)
+            gTd = 0.0f0
+            @inbounds @simd for i in eachindex(θ) 
+                gTd += g[i] * (θ_trial[i] - θ[i]) 
+            end
+
+            L_trial = loss_only_batched!(θ_trial, batch)
+            n_back += 1
+        end
+
+        L_trial, g_trial = loss_and_grad_batched!(θ_trial, batch)
+
+        # Accept
+        θ_prev .= θ
+        g_prev .= g
+        θ      .= θ_trial
+        L       = L_trial
+        g       = g_trial
+
+        # nonmonotone window
+        if win_len < m_hist
+            win_len += 1
+            loss_win[win_len] = L
+        else
+            @inbounds @simd for i in 1:m_hist-1
+                loss_win[i] = loss_win[i+1]
+            end
+            loss_win[m_hist] = L
+        end
+
+        # Early stop
+        if L < best_L * (1f0 - loss_tol_rel)
+            best_L = L
+            stall = 0
+        else
+            stall += 1
+            if stall >= patience
+                @info "Early stop (loss plateau)" it=it best_L=best_L current_L=L patience=patience
+                return θ, L, losses[1:it]
+            end
+        end
+
+        if (it % 10 == 0) || (it <= 5)
+            @info "iter" it=it L=L grad=gnorm α=α backtracks=n_back
+        end
     end
-    return evaluate_and_grad!(target_mag), losses, grad_hist, lr_hist
+
+    @info "Training complete (SPG-BB)" final_loss=L
+    return θ, L, losses
 end
 
-function final_profile_mag!(backend)
-    upsample_rf!(s_B1r, s_B1i, RF_I, RF_Q)
-    fill!(M_xy, 0.0f0); fill!(M_z, 1.0f0)      
+function final_profile_mag!(Ih, Qh)
+    copyto!(seg_I_dev, Ih)
+    copyto!(seg_Q_dev, Qh)
+    copyto!(p_z, p_z_base_h)
+    device_upsample!(s_B1r, s_B1i, seg_I_dev, seg_Q_dev)
+
+    fill!(M_xy, 0.0f0)
+    fill!(M_z, 1.0f0)
     excite_only!(M_xy, M_z,
                  p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
                  s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
                  backend)
+                 
     KernelAbstractions.synchronize(backend)
     N = Int(N_Spins32)
     Mr = Array(view(M_xy, 1:N))
@@ -423,45 +676,55 @@ function final_profile_mag!(backend)
     return sqrt.(Mr .* Mr .+ Mi .* Mi)
 end
 
-function plot_training_history(losses::AbstractVector{<:Real};
-                               grad_hist::Union{Nothing,AbstractVector{<:Real}}=nothing,
-                               lr_hist::Union{Nothing,AbstractVector{<:Real}}=nothing)
-    ENV["GKSwstype"] = "100"
-    it = 1:length(losses)
-    if grad_hist === nothing && lr_hist === nothing
-        return plot(it, losses, lw=2, xlabel="iter", ylabel="loss", title="Loss")
-    else
-        p1 = plot(it, losses, lw=2, xlabel="iter", ylabel="loss", title="Loss")
-        p2 = grad_hist === nothing ? plot() :
-             plot(it, grad_hist, lw=2, xlabel="iter", ylabel="‖grad‖", yscale=:log10, title="Grad norm")
-        p3 = lr_hist === nothing ? plot() :
-             plot(it, lr_hist, lw=2, xlabel="iter", ylabel="lr", yscale=:log10, title="LR")
-        return plot(p1, p2, p3; layout=(1,3), size=(1200,350))
-    end
-end
+function plot_results(RF_Ih, RF_Qh; title_rf="Final RF", title_prof="Slice profile", path=nothing)
+    copyto!(seg_I_dev, RF_Ih)
+    copyto!(seg_Q_dev, RF_Qh)
+    device_upsample!(s_B1r, s_B1i, seg_I_dev, seg_Q_dev)
 
-function plot_results()
-    upsample_rf!(s_B1r, s_B1i, RF_I, RF_Q)
     t = collect(0:dt:(Nt-1)*dt)
-    p_rf = plot(t, Array(s_B1r), label="B1r", xlabel="time (s)", ylabel="B1", title="Final RF pulse")
-    plot!(p_rf, t, Array(s_B1i), label="B1i")
-    z_mm = 1.0f3 .* p_z_h
-    prof_mag = final_profile_mag!(backend)
-    p_prof = plot(z_mm, target_mag_h; label="Target box", xlabel="z (mm)", ylabel="|M_xy|",
-                  title="Slice profile magnitude", lw=3, ls=:dash)
-    plot!(p_prof, z_mm, prof_mag; label="Achieved", lw=3)
-    plot(p_rf, p_prof; layout=(2,1), size=(900,800))
+    z_mm = 1.0f3 .* p_z_base_h
+    prof_mag = final_profile_mag!(RF_Ih, RF_Qh)
+    tgt_plot = butterworth_target(p_z_base_h; cutoff=BW_CUTOFF, n=BW_ORDER)
+
+    plt = plot(layout=(2,1), size=(900,800))
+    plot!(plt[1], t, Array(s_B1r); label="B1r", xlabel="time (s)", ylabel="B1", title=title_rf, lw=2)
+    plot!(plt[1], t, Array(s_B1i); label="B1i", lw=2)
+    plot!(plt[2], z_mm, tgt_plot; label="Target", xlabel="z (mm)", ylabel="|M_xy|",
+          title=title_prof, lw=3, ls=:dash)
+    plot!(plt[2], z_mm, prof_mag; label="Achieved", lw=3)
+    if path !== nothing
+        savefig(plt, path)
+    end
+    return plt
 end
 
-final_loss, losses, grad_hist, lr_hist = run_adamw!(300; lr=3.0f-3, weight_decay=1.0f-4, grad_clip=5.0f1)
-@info "Final" loss=final_loss
+function save_training_history_png(losses; path="training_history.png", ttl="Loss")
+    p = plot(1:length(losses), losses; lw=2, xlabel="iter", ylabel="loss", title=ttl, size=(900,350))
+    savefig(p, path)
+end
 
-p_hist = plot_training_history(losses; grad_hist=grad_hist, lr_hist=lr_hist)
-savefig(p_hist, "training_history.png")
+const NSC = 3
+batch = make_scenarios(NSC, 1.0f0)
 
-prof = final_profile_mag!(backend)
-core = prof[in_core_h]; stop = prof[in_stop_h]
-@info "Passband" mean=mean(core) ripple=(maximum(core)-minimum(core))
-@info "Stopband" max=maximum(stop) mean=mean(stop)
+θ0 = Float32.(vcat(RF_I_h, RF_Q_h))
 
-savefig(plot_results(), "final_rf_profile.png")
+timed = @timed run_spg_bb!(copy(θ0), batch;
+    max_iters=150, m_hist=10, loss_tol_rel=5f-4, patience=15)
+θ_exc, L_exc, losses_exc = timed.value
+t_sec = timed.time
+@info "Optimization time" seconds=t_sec minutes=t_sec/60
+
+RF_I_h .= θ_exc[1:NUM_TIME_SEGMENTS]
+RF_Q_h .= θ_exc[NUM_TIME_SEGMENTS+1:2NUM_TIME_SEGMENTS]
+@info "Excitation complete" loss=L_exc
+
+save_training_history_png(losses_exc; path="training_history.png", ttl="Loss")
+plot_results(RF_I_h, RF_Q_h; path="final_rf_profile.png")
+
+in_core_base, in_stop_base, target_base = make_target_and_masks(p_z_base_h)
+prof_exc = final_profile_mag!(RF_I_h, RF_Q_h)
+core = prof_exc[in_core_base .> 0.5f0]; stop = prof_exc[in_stop_base .> 0.5f0]
+@info "Excitation Passband" mean=mean(core) ripple=(maximum(core)-minimum(core))
+@info "Excitation Stopband" max=maximum(stop) mean=mean(stop)
+
+println("Saved: training_history.png, final_rf_profile.png")
