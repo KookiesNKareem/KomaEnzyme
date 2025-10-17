@@ -20,8 +20,8 @@ const fmax = TBP / Trf
 const γf64 = 2π * 42.57747892e6       # rad/(s·T)
 const γ    = Float32(γf64)
 
-const Nspins = 256
-const GROUP_SIZE = 256
+const Nspins = 512
+const GROUP_SIZE = 512
 
 z  = collect(range(-zmax, zmax, length=Nspins))
 Gz = fmax / (Float64(γf64) * Δz)
@@ -111,46 +111,33 @@ B1i_host = copy(imag.(TL.B1))
     p_ΔBz::AbstractVector{T}, p_T1::AbstractVector{T}, p_T2::AbstractVector{T}, p_ρ::AbstractVector{T},
     s_Gx::AbstractVector{T}, s_Gy::AbstractVector{T}, s_Gz::AbstractVector{T},
     s_Δt::AbstractVector{T}, s_Δf::AbstractVector{T}, s_B1r::AbstractVector{T}, s_B1i::AbstractVector{T},
-    N_Spins::Int32, N_Δt::Int32
+    N_Spins::Int, N_Δt::Int
 ) where {T}
     eps_d = T(1f-20)
-    i = Int(Tuple(@index(Global))[1])
-    if i <= Int(N_Spins)
-        N   = Int(N_Spins)
-        ir  = i
-        ii  = i + N
+    i = @index(Global, Linear)  # 1-based
 
-        x   = p_x[i]
-        y = p_y[i]
-        z = p_z[i]
+    if i <= N_Spins
+        N  = N_Spins
+        ir = i
+        ii = i + N
 
-        ΔBz = p_ΔBz[i]
-        ρ   = p_ρ[i]
-        T1 = p_T1[i]
-        T2 = p_T2[i]
+        x   = p_x[ir]; y = p_y[ir]; z = p_z[ir]
+        ΔBz = p_ΔBz[ir]; ρ = p_ρ[ir]
+        T1  = p_T1[ir];  T2 = p_T2[ir]
 
-        Mx  = M_xy[ir]
-        My = M_xy[ii]
-        Mz = M_z[i]
+        Mx  = M_xy[ir];  My = M_xy[ii];  Mz = M_z[ir]
 
-        s_idx = 1
-        @inbounds while s_idx <= Int(N_Δt)
-            gx  = s_Gx[s_idx]
-            gy = s_Gy[s_idx]
-            gz = s_Gz[s_idx]
-
-            Δt  = s_Δt[s_idx]
-            df = s_Δf[s_idx]
-            b1r = s_B1r[s_idx]
-            b1i = s_B1i[s_idx]
+        @inbounds for s_idx in 1:N_Δt
+            gx  = s_Gx[s_idx]; gy = s_Gy[s_idx]; gz = s_Gz[s_idx]
+            Δt  = s_Δt[s_idx]; df = s_Δf[s_idx]
+            b1r = s_B1r[s_idx]; b1i = s_B1i[s_idx]
 
             Bz = (x*gx + y*gy + z*gz) + ΔBz - df / T(γ)
 
-            B  = sqrt(b1r*b1r + b1i*b1i + Bz*Bz)
-            φ  = T(-π) * T(γ) * B * Δt   
+            B   = sqrt(b1r*b1r + b1i*b1i + Bz*Bz)
+            φ   = T(-π) * T(γ) * B * Δt
 
-            sφ = sin(φ)
-            cφ = cos(φ)
+            sφ = sin(φ); cφ = cos(φ)
             denom = B + eps_d
 
             α_r =  cφ
@@ -173,13 +160,11 @@ B1i_host = copy(imag.(TL.B1))
             Mx = Mx_new * ΔT2
             My = My_new * ΔT2
             Mz = Mz_new * ΔT1 + ρ * (T(1f0) - ΔT1)
-
-            s_idx += 1
         end
 
         M_xy[ir] = Mx
         M_xy[ii] = My
-        M_z[i]   = Mz
+        M_z[ir]  = Mz
     end
 end
 
@@ -187,12 +172,13 @@ function launch_excitation!(
     M_xy, M_z,
     p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-    N_Spins::Int32, N_Δt::Int32, backend)
+    N_Spins::Int, N_Δt::Int, backend)
     k = excitation_kernel!(backend)
+    wgs = min(GROUP_SIZE, N_Spins)
     k(M_xy, M_z,
       p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
       s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-      N_Spins, N_Δt; ndrange=Int(N_Spins), workgroupsize=GROUP_SIZE)
+      N_Spins, N_Δt; ndrange=N_Spins, workgroupsize=wgs)
     return nothing
 end
 
@@ -206,7 +192,7 @@ Base.@noinline function excite_only!(
         M_xy, M_z,
         p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
         s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-        N_Spins32, N_Δt32, backend)
+        Int(N_Spins32), Int(N_Δt32), backend)
     return nothing
 end
 
@@ -406,29 +392,6 @@ function loss_and_grad!(∇x::Vector{Float32}, x::Vector{Float32})
     return L
 end
 
-
-let
-    x0_ctrl = Float32.(real.(seq.RF[1].A))
-    x_to_timeline!(B1r_host, B1i_host, x0_ctrl)
-
-    copyto!(s_B1r, B1r_host)
-    copyto!(s_B1i, B1i_host)
-    fill!(M_xy, 0f0)
-    fill!(M_z, 1f0)
-    launch_excitation!(
-        M_xy, M_z,
-        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
-        s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-        N_Spins32, N_Δt32, backend)
-    KernelAbstractions.synchronize(backend)
-
-    Mr = Array(view(M_xy, 1:N))
-    Mi = Array(view(M_xy, N+1:2N))
-    cosφ, sinφ = compute_phase_arrays(Mr, Mi)
-    Mrot_mag = sqrt.((Mr .* cosφ .+ Mi .* sinφ).^2 .+ (Mi .* cosφ .- Mr .* sinφ).^2)
-    diff_mag = Mrot_mag .- Float32.(abs.(mag_sinc.xy))
-end
-
 x = zeros(Float32, n_ctrl)
 ∇x = similar(x)
 L0 = loss_and_grad!(∇x, x)
@@ -459,7 +422,7 @@ function plot_rf_and_profile(x)
         M_xy, M_z,
         p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
         s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1r, s_B1i,
-        N_Spins32, N_Δt32, backend)
+        Int(N_Spins32), Int(N_Δt32), backend)
     KernelAbstractions.synchronize(backend)
 
     Mr = Array(view(M_xy, 1:N))
