@@ -1,0 +1,31 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Julia
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+deps/deps.jl
+
+# Output directories
+debug/
+examples/
+figs/
+Results/
+target_images/
+
+# Generated files
+*.png
+*.pdf
+*.jld2
+*.h5
+*.mat
+
+# OS
+.DS_Store
+Thumbs.db
